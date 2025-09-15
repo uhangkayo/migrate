@@ -239,24 +239,11 @@ remote_subdomain_menu(){
   fi
 }
 
-ensure_source_connection_ready(){
-  local -a missing=()
-  [[ -n "$SRC_HOST" ]] || missing+=("SRC_HOST")
-  [[ -n "$SRC_USER" ]] || missing+=("SRC_USER")
-  [[ -n "$SRC_PORT" ]] || missing+=("SRC_PORT")
-  [[ -n "$SUBDOMAIN" ]] || missing+=("SUBDOMAIN")
-
-  if (( ${#missing[@]} > 0 )); then
-    err "Profil belum lengkap: ${missing[*]}. Jalankan menu '2) Set Source Connection (Quick)'."
-    return 1
-  fi
-  return 0
-}
 
 # ====== Steps ======
 deps_menu(){
-  local mode="${1:-}"
-  local auto=0
+  local mode="${1:-}" auto=0
+
   [[ "$mode" == "--auto" ]] && auto=1
 
   echo "Memeriksa dependencies..."
@@ -339,10 +326,56 @@ source_connection_menu(){
   read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
   test_now="${test_now:-Y}"
   if [[ "$test_now" =~ ^[Yy]$ ]]; then
-    if ! test_connect_menu; then
-      warn "Tes koneksi gagal. Periksa kembali host/user/password sebelum melanjutkan."
+
+    test_connect_menu
+  else
+    pause
+  fi
+}
+
+source_connection_menu(){
+  echo "Konfigurasi koneksi SOURCE (server lama). Kosongkan untuk mempertahankan nilai saat ini."
+  local input usepass default_usepass test_now
+
+  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
+  if [[ -n "$input" ]]; then
+    SRC_HOST="$input"
+  fi
+
+  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
+  SRC_USER="${input:-${SRC_USER:-root}}"
+
+  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
+  SRC_PORT="${input:-${SRC_PORT:-22}}"
+
+  default_usepass="N"
+  [[ -n "$SSHPASS" ]] && default_usepass="Y"
+  read -r -p "Gunakan password/sshpass? (y/N) [$default_usepass]: " usepass
+  usepass="${usepass:-$default_usepass}"
+
+  if [[ "$usepass" =~ ^[Yy]$ ]]; then
+    if need sshpass; then
+      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
+    else
+      warn "sshpass belum ada; install dulu di menu Dependencies."
+      SSHPASS=""
     fi
   else
+    SSHPASS=""
+  fi
+
+  if [[ -z "$SRC_HOST" ]]; then
+    warn "SRC_HOST masih kosong. Lengkapi sebelum melanjutkan."
+  fi
+
+  [[ -n "$SUBDOMAIN" ]] && save_profile
+
+  read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
+  test_now="${test_now:-Y}"
+  if [[ "$test_now" =~ ^[Yy]$ ]]; then
+    test_connect_menu
+  else
+
     pause
   fi
 }
@@ -396,14 +429,14 @@ load_profile_menu(){
 }
 
 test_connect_menu(){
-  local mode="${1:-}"
-  local auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
 
+
+  local skip_pause="${1:-0}"
   if [[ -z "$SRC_HOST" ]]; then
     err "Profil belum lengkap (SRC_HOST kosong)"
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 1
+    [[ "$skip_pause" == "1" ]] || pause
+    return
+
   fi
 
   SRC_USER="${SRC_USER:-root}"
@@ -412,11 +445,10 @@ test_connect_menu(){
   log "Tes koneksi SSH ke $SRC_USER@$SRC_HOST:$SRC_PORT ..."
   if ssh_check; then
     notify "✅ SSH non-interaktif OK"
-    if [[ $auto -eq 1 ]]; then
-      log "Mode auto: lewati pemilihan subdomain interaktif."
-    else
-      remote_subdomain_menu
-    fi
+
+
+    remote_subdomain_menu
+
   else
     if [[ -z "$SSHPASS" ]]; then
       warn "SSH key tidak bekerja. Opsi: jalankan 'ssh-copy-id -p $SRC_PORT $SRC_USER@$SRC_HOST' atau set SSHPASS + install sshpass."
@@ -427,15 +459,16 @@ test_connect_menu(){
     return 1
   fi
 
-  if [[ $auto -ne 1 ]]; then
+
+
+  if [[ "$skip_pause" != "1" ]]; then
     pause
   fi
-  return 0
+
 }
 
 detect_webroot_menu(){
-  local mode="${1:-}"
-  local auto=0
+  local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ -z "$SUBDOMAIN" || -z "$SRC_HOST" ]]; then
@@ -464,8 +497,8 @@ detect_webroot_menu(){
 }
 
 detect_db_menu(){
-  local mode="${1:-}"
-  local auto=0
+
+  local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ -z "$SRC_WEBROOT" ]]; then
@@ -528,8 +561,8 @@ detect_db_menu(){
 }
 
 migrate_files_menu(){
-  local mode="${1:-}"
-  local auto=0
+
+  local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ -z "$SUBDOMAIN" || -z "$SRC_WEBROOT" ]]; then
@@ -581,8 +614,8 @@ migrate_files_menu(){
 }
 
 import_db_menu(){
-  local mode="${1:-}"
-  local auto=0
+
+  local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ "$WANT_DB" != "yes" || -z "${DB_NAME:-}" ]]; then
@@ -630,8 +663,8 @@ import_db_menu(){
 }
 
 nginx_menu(){
-  local mode="${1:-}"
-  local auto=0
+
+  local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
   local yn
@@ -695,8 +728,8 @@ CONF
 }
 
 finalize_menu(){
-  local mode="${1:-}"
-  local auto=0
+
+  local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
   [[ -z "$DST_WEBROOT" ]] && DST_WEBROOT="/var/www/${SUBDOMAIN}"
@@ -785,7 +818,7 @@ main_menu(){
       echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
     fi
     echo " 1) Dependencies Check"
-    echo " 2) Set Source Connection (Quick)"
+    echo " 2) Set Source Connection"
     echo " 3) New Profile"
     echo " 4) Load Profile"
     echo " 5) Test SSH Connectivity"
