@@ -164,8 +164,98 @@ list_profiles(){
   ls -1 "$PROFILE_DIR" 2>/dev/null | sed 's/\.conf$//' || true
 }
 
+remote_subdomains_fetch(){
+  local cmd
+  cmd=$(cat <<'CMD'
+(
+  for path in /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available; do
+    if [ -d "$path" ]; then
+      grep -RhoE "server_name[[:space:]]+[^;#]*" "$path" 2>/dev/null
+    fi
+  done
+) | awk "{for (i=2; i<=NF; i++) {gsub(/;$/,"", $i); if (length($i) > 0 && index($i, ".") > 0) print $i;}}" | sort -u
+CMD
+  )
+  remote_marked "$cmd" | tr -d '\r' | sed '/^[[:space:]]*$/d'
+}
+
+remote_subdomain_menu(){
+  log "Mengambil daftar subdomain (server_name) dari SOURCE..."
+  local raw; raw="$(remote_subdomains_fetch || true)"
+  raw="$(printf '%s\n' "$raw" | sed '/^[[:space:]]*$/d')"
+  if [[ -z "$raw" ]]; then
+    warn "Tidak menemukan daftar subdomain dari konfigurasi Nginx SOURCE."
+    return
+  fi
+
+  local -a subdomain_list=()
+  mapfile -t subdomain_list <<<"$raw"
+  if [[ ${#subdomain_list[@]} -eq 0 ]]; then
+    warn "Daftar subdomain kosong."
+    return
+  fi
+
+  echo "==================== DAFTAR SUBDOMAIN SOURCE ===================="
+  local idx
+  for idx in "${!subdomain_list[@]}"; do
+    printf " %2d) %s\n" "$((idx + 1))" "${subdomain_list[$idx]}"
+  done
+  echo "-----------------------------------------------------------------"
+  local selection
+  read -r -p "Pilih nomor untuk set SUBDOMAIN atau ketik manual (Enter=skip): " selection || true
+
+  if [[ "$selection" =~ ^[0-9]+$ ]]; then
+    local index=$((selection - 1))
+    if (( index >= 0 && index < ${#subdomain_list[@]} )); then
+      local chosen="${subdomain_list[$index]}"
+      chosen="$(sanitize "$chosen")"
+      if [[ -n "$chosen" ]]; then
+        SUBDOMAIN="$chosen"
+        DST_WEBROOT="/var/www/${SUBDOMAIN}"
+        SRC_WEBROOT=""
+        notify "SUBDOMAIN di-set ke $SUBDOMAIN (DST webroot direset ke default)."
+        save_profile
+      fi
+    else
+      warn "Nomor di luar jangkauan daftar subdomain."
+    fi
+    return
+  fi
+
+  if [[ -n "$selection" ]]; then
+    local manual
+    manual="$(sanitize "$selection")"
+    if [[ -n "$manual" ]]; then
+      SUBDOMAIN="$manual"
+      DST_WEBROOT="/var/www/${SUBDOMAIN}"
+      SRC_WEBROOT=""
+      notify "SUBDOMAIN di-set ke $SUBDOMAIN (input manual)."
+      save_profile
+    else
+      warn "Input manual kosong setelah disanitasi."
+    fi
+  fi
+}
+
+ensure_source_connection_ready(){
+  local -a missing=()
+  [[ -n "$SRC_HOST" ]] || missing+=("SRC_HOST")
+  [[ -n "$SRC_USER" ]] || missing+=("SRC_USER")
+  [[ -n "$SRC_PORT" ]] || missing+=("SRC_PORT")
+  [[ -n "$SUBDOMAIN" ]] || missing+=("SUBDOMAIN")
+
+  if (( ${#missing[@]} > 0 )); then
+    err "Profil belum lengkap: ${missing[*]}. Jalankan menu '2) Set Source Connection (Quick)'."
+    return 1
+  fi
+  return 0
+}
+
 # ====== Steps ======
 deps_menu(){
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
   echo "Memeriksa dependencies..."
   local missing=0
   for bin in ssh rsync mysql mysqldump awk sed tar gzip; do
@@ -177,17 +267,101 @@ deps_menu(){
       missing=1
     fi
   fi
-  [[ "$missing" == "0" ]] && notify "✅ Dependencies OK" || warn "Ada dependency yang belum lengkap."
-  pause
+  if [[ "$missing" == "0" ]]; then
+    notify "✅ Dependencies OK"
+  else
+    warn "Ada dependency yang belum lengkap."
+  fi
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return $missing
+}
+
+source_connection_menu(){
+  echo "Set Source Connection (Quick). Isikan untuk menyiapkan koneksi dasar sebelum menjalankan ONE-CLICK."
+  local input usepass default_usepass test_now
+
+  read -r -p "Sub-domain (mis: blog.domain.com) [${SUBDOMAIN:-}]: " input
+  if [[ -n "$input" ]]; then
+    local sanitized; sanitized="$(sanitize "$input")"
+    if [[ -n "$sanitized" ]]; then
+      SUBDOMAIN="$sanitized"
+      DST_WEBROOT="/var/www/${SUBDOMAIN}"
+      SRC_WEBROOT=""
+      notify "SUBDOMAIN di-set ke $SUBDOMAIN"
+    else
+      warn "Input subdomain kosong setelah disanitasi."
+    fi
+  fi
+
+  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
+  if [[ -n "$input" ]]; then
+    SRC_HOST="$input"
+  fi
+
+  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
+  SRC_USER="${input:-${SRC_USER:-root}}"
+
+  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
+  SRC_PORT="${input:-${SRC_PORT:-22}}"
+
+  default_usepass="N"
+  [[ -n "$SSHPASS" ]] && default_usepass="Y"
+  read -r -p "Gunakan password/sshpass? (y/N) [$default_usepass]: " usepass
+  usepass="${usepass:-$default_usepass}"
+
+  if [[ "$usepass" =~ ^[Yy]$ ]]; then
+    if need sshpass; then
+      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
+    else
+      warn "sshpass belum ada; install dulu di menu Dependencies."
+      SSHPASS=""
+    fi
+  else
+    SSHPASS=""
+  fi
+
+  if [[ -z "$SRC_HOST" ]]; then
+    warn "SRC_HOST masih kosong. Lengkapi sebelum melanjutkan."
+  fi
+
+  if [[ -n "$SUBDOMAIN" ]]; then
+    save_profile
+  else
+    warn "SUBDOMAIN masih kosong; isi agar profil dapat disimpan."
+  fi
+
+  read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
+  test_now="${test_now:-Y}"
+  if [[ "$test_now" =~ ^[Yy]$ ]]; then
+    test_connect_menu
+  else
+    pause
+  fi
 }
 
 new_profile_menu(){
+  local input usepass default_usepass
   read -r -p "Sub-domain (mis: blog.domain.com): " SUBDOMAIN
   SUBDOMAIN="$(sanitize "$SUBDOMAIN")"
-  read -r -p "IP/Host server LAMA (SOURCE): " SRC_HOST
-  read -r -p "User SSH SOURCE [root]: " SRC_USER; SRC_USER="${SRC_USER:-root}"
-  read -r -p "Port SSH SOURCE [22]: " SRC_PORT; SRC_PORT="${SRC_PORT:-22}"
-  read -r -p "Pakai password (y/N)? Jika y, akan diminta password setelah tes koneksi: " usepass; usepass="${usepass:-N}"
+
+  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
+  if [[ -n "$input" ]]; then
+    SRC_HOST="$input"
+  fi
+
+  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
+  SRC_USER="${input:-${SRC_USER:-root}}"
+
+  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
+  SRC_PORT="${input:-${SRC_PORT:-22}}"
+
+  default_usepass="N"
+  [[ -n "$SSHPASS" ]] && default_usepass="Y"
+  read -r -p "Pakai password (y/N)? Jika y, akan diminta password setelah tes koneksi [$default_usepass]: " usepass
+  usepass="${usepass:-$default_usepass}"
 
   DST_WEBROOT="/var/www/${SUBDOMAIN}"
   SRC_WEBROOT=""   # biarkan auto
@@ -198,6 +372,7 @@ new_profile_menu(){
       read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
     else
       warn "sshpass belum ada; install dulu di menu Dependencies."
+      SSHPASS=""
     fi
   else
     SSHPASS=""
@@ -216,22 +391,52 @@ load_profile_menu(){
 }
 
 test_connect_menu(){
-  [[ -n "$SUBDOMAIN" && -n "$SRC_HOST" ]] || { err "Profil belum lengkap"; pause; return; }
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
+  if [[ -z "$SRC_HOST" ]]; then
+    err "Profil belum lengkap (SRC_HOST kosong)"
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 1
+  fi
+
+  SRC_USER="${SRC_USER:-root}"
+  SRC_PORT="${SRC_PORT:-22}"
+
   log "Tes koneksi SSH ke $SRC_USER@$SRC_HOST:$SRC_PORT ..."
   if ssh_check; then
     notify "✅ SSH non-interaktif OK"
+    if [[ $auto -eq 1 ]]; then
+      log "Mode auto: lewati pemilihan subdomain interaktif."
+    else
+      remote_subdomain_menu
+    fi
   else
     if [[ -z "$SSHPASS" ]]; then
       warn "SSH key tidak bekerja. Opsi: jalankan 'ssh-copy-id -p $SRC_PORT $SRC_USER@$SRC_HOST' atau set SSHPASS + install sshpass."
     else
       warn "SSH pass mungkin salah atau root login ditolak oleh SOURCE."
     fi
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 1
   fi
-  pause
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return 0
 }
 
 detect_webroot_menu(){
-  [[ -n "$SUBDOMAIN" && -n "$SRC_HOST" ]] || { err "Profil belum lengkap"; pause; return; }
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
+  if [[ -z "$SUBDOMAIN" || -z "$SRC_HOST" ]]; then
+    err "Profil belum lengkap"
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 1
+  fi
+
   if [[ -z "$SRC_WEBROOT" ]]; then
     log "Deteksi webroot via Nginx SOURCE..."
     local conf; conf="$(remote_marked "grep -RIl \"server_name[[:space:]]\\+${SUBDOMAIN}[;]\" /etc/nginx/sites-enabled 2>/dev/null | head -n1" | head -n1 || true)"
@@ -244,12 +449,27 @@ detect_webroot_menu(){
   else
     log "SOURCE webroot sudah di-set: $SRC_WEBROOT"
   fi
-  pause
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return 0
 }
 
 detect_db_menu(){
-  [[ -n "$SRC_WEBROOT" ]] || { err "Set/deteksi webroot dulu"; pause; return; }
-  [[ "$WANT_DB" == "no" ]] && { warn "DB diset tidak akan dipindah (NO_DB)."; pause; return; }
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
+  if [[ -z "$SRC_WEBROOT" ]]; then
+    err "Set/deteksi webroot dulu"
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 1
+  fi
+  if [[ "$WANT_DB" == "no" ]]; then
+    warn "DB diset tidak akan dipindah (NO_DB)."
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 0
+  fi
 
   log "Cari wp-config.php di SOURCE..."
   local WPC; WPC="$(remote_marked "find \"$SRC_WEBROOT\" -maxdepth 3 -type f -name wp-config.php 2>/dev/null | head -n1" | tr -d '\r' || true)"
@@ -293,11 +513,21 @@ detect_db_menu(){
     WANT_DB="no"
     save_profile
   fi
-  pause
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return 0
 }
 
 migrate_files_menu(){
-  [[ -n "$SUBDOMAIN" && -n "$SRC_WEBROOT" ]] || { err "Profil belum lengkap (subdomain/webroot)"; pause; return; }
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
+  if [[ -z "$SUBDOMAIN" || -z "$SRC_WEBROOT" ]]; then
+    err "Profil belum lengkap (subdomain/webroot)"
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 1
+  fi
   DST_WEBROOT="${DST_WEBROOT:-/var/www/${SUBDOMAIN}}"
   mkdir -p "$DST_WEBROOT"
 
@@ -305,26 +535,51 @@ migrate_files_menu(){
   [[ -z "${est:-}" ]] && est=0
   log "Perkiraan size SOURCE: $(bytes_to_h "$est")"
 
-  read -r -p "Pakai rsync (Y) atau tar fallback (t)? [Y/t]: " choice; choice="${choice:-Y}"
-  if [[ "$choice" =~ ^[Tt]$ ]]; then FORCE_RSYNC="0"; else FORCE_RSYNC="1"; fi
-  read -r -p "Dry-run dulu untuk rsync? (y/N): " dry; dry="${dry:-N}"; [[ "$dry" =~ ^[Yy]$ ]] && DRY_RUN="1" || DRY_RUN="0"
+  if [[ $auto -eq 1 ]]; then
+    FORCE_RSYNC="1"
+    DRY_RUN="0"
+  else
+    read -r -p "Pakai rsync (Y) atau tar fallback (t)? [Y/t]: " choice; choice="${choice:-Y}"
+    if [[ "$choice" =~ ^[Tt]$ ]]; then FORCE_RSYNC="0"; else FORCE_RSYNC="1"; fi
+    read -r -p "Dry-run dulu untuk rsync? (y/N): " dry; dry="${dry:-N}"; [[ "$dry" =~ ^[Yy]$ ]] && DRY_RUN="1" || DRY_RUN="0"
+  fi
   save_profile
 
   notify "Mulai tarik FILES..."
+  local status=0
   if [[ "$FORCE_RSYNC" == "1" ]]; then
-    rsync_pull "${SRC_USER}@${SRC_HOST}:${SRC_WEBROOT}" "${DST_WEBROOT}" || {
+    if ! rsync_pull "${SRC_USER}@${SRC_HOST}:${SRC_WEBROOT}" "${DST_WEBROOT}"; then
       warn "rsync gagal, fallback ke tar stream"
-      tar_pull "${SRC_WEBROOT}" "${DST_WEBROOT}"
-    }
+      if ! tar_pull "${SRC_WEBROOT}" "${DST_WEBROOT}"; then
+        err "Tar fallback gagal"
+        status=1
+      fi
+    fi
   else
-    tar_pull "${SRC_WEBROOT}" "${DST_WEBROOT}"
+    if ! tar_pull "${SRC_WEBROOT}" "${DST_WEBROOT}"; then
+      err "Tar fallback gagal"
+      status=1
+    fi
   fi
-  notify "FILES selesai."
-  pause
+  if [[ $status -eq 0 ]]; then
+    notify "FILES selesai."
+  fi
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return $status
 }
 
 import_db_menu(){
-  [[ "$WANT_DB" == "yes" && -n "${DB_NAME:-}" ]] || { warn "Import DB dilewati (tidak terdeteksi atau dinonaktifkan)."; pause; return; }
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
+  if [[ "$WANT_DB" != "yes" || -z "${DB_NAME:-}" ]]; then
+    warn "Import DB dilewati (tidak terdeteksi atau dinonaktifkan)."
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 0
+  fi
 
   T_DB="${T_DB:-$DB_NAME}"
   T_USER="${T_USER:-${DB_USER:-${SUBDOMAIN//./_}}}"
@@ -342,23 +597,51 @@ import_db_menu(){
   fi
 
   notify "Menarik & import DB..."
-  remote_marked "$dump_cmd" | gzip -d | mysql "$T_DB"
-  notify "Import DB selesai → target: $T_DB (user=$T_USER)"
-  save_profile
+  local status=0
+  if ! remote_marked "$dump_cmd" | gzip -d | mysql "$T_DB"; then
+    err "Import DB gagal"
+    status=1
+  else
+    notify "Import DB selesai → target: $T_DB (user=$T_USER)"
+    save_profile
 
-  # Patch wp-config.php target (jika ada)
-  if [[ -f "$DST_WEBROOT/wp-config.php" ]]; then
-    sed -ri "s/define\('DB_NAME',[[:space:]]*'[^']*'\)/define('DB_NAME', '$T_DB')/" "$DST_WEBROOT/wp-config.php" || true
-    sed -ri "s/define\('DB_USER',[[:space:]]*'[^']*'\)/define('DB_USER', '$T_USER')/" "$DST_WEBROOT/wp-config.php" || true
-    sed -ri "s/define\('DB_PASSWORD',[[:space:]]*'[^']*'\)/define('DB_PASSWORD', '$T_PASS')/" "$DST_WEBROOT/wp-config.php" || true
+    # Patch wp-config.php target (jika ada)
+    if [[ -f "$DST_WEBROOT/wp-config.php" ]]; then
+      sed -ri "s/define\('DB_NAME',[[:space:]]*'[^']*'\)/define('DB_NAME', '$T_DB')/" "$DST_WEBROOT/wp-config.php" || true
+      sed -ri "s/define\('DB_USER',[[:space:]]*'[^']*'\)/define('DB_USER', '$T_USER')/" "$DST_WEBROOT/wp-config.php" || true
+      sed -ri "s/define\('DB_PASSWORD',[[:space:]]*'[^']*'\)/define('DB_PASSWORD', '$T_PASS')/" "$DST_WEBROOT/wp-config.php" || true
+    fi
   fi
-  pause
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return $status
 }
 
 nginx_menu(){
-  read -r -p "Tulis block Nginx? (Y/n) [Y]: " yn; yn="${yn:-Y}"
-  if [[ "$yn" =~ ^[Nn]$ ]]; then NO_NGINX="1"; save_profile; return; fi
-  NO_NGINX="0"; save_profile
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
+  local yn
+  if [[ $auto -eq 1 ]]; then
+    if [[ "$NO_NGINX" == "1" ]]; then
+      log "Mode auto: konfigurasi Nginx dilewati karena NO_NGINX=1."
+      return 0
+    fi
+    yn="Y"
+  else
+    read -r -p "Tulis block Nginx? (Y/n) [Y]: " yn
+    yn="${yn:-Y}"
+  fi
+  if [[ "$yn" =~ ^[Nn]$ ]]; then
+    NO_NGINX="1"
+    save_profile
+    if [[ $auto -ne 1 ]]; then pause; fi
+    return 0
+  fi
+  NO_NGINX="0"
+  save_profile
 
   local SOCK; SOCK="$(phpfpm_sock_guess)"
   local SCONF="/etc/nginx/sites-available/${SUBDOMAIN}.conf"
@@ -373,41 +656,105 @@ server {
 
     location / { try_files \$uri \$uri/ /index.php?\$query_string; }
 
-    location ~ \.php$ {
+    location ~ \\.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:${SOCK};
     }
 
-    location ~* \.(jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?)$ {
+    location ~* \\.(jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?)$ {
         expires max; access_log off; log_not_found off;
     }
 }
 CONF
     ln -sf "$SCONF" "/etc/nginx/sites-enabled/${SUBDOMAIN}.conf"
   fi
-  nginx -t && systemctl reload nginx || warn "Nginx reload gagal; cek config."
-  pause
+
+  local status=0
+  if nginx -t; then
+    systemctl reload nginx || { warn "Nginx reload gagal; cek config."; status=1; }
+  else
+    warn "Nginx test gagal; periksa konfigurasi."
+    status=1
+  fi
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return $status
 }
 
 finalize_menu(){
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
+
   [[ -z "$DST_WEBROOT" ]] && DST_WEBROOT="/var/www/${SUBDOMAIN}"
   chown -R www-data:www-data "$DST_WEBROOT" || true
   systemctl list-units | grep -Eo 'php[0-9.]+-fpm\.service' | sort -u | xargs -r -n1 systemctl reload || true
   notify "Selesai. Arahkan DNS A record ${SUBDOMAIN} ke IP server baru saat siap cutover."
   log "Log selesai: $LOG_FILE"
-  pause
+
+  if [[ $auto -ne 1 ]]; then
+    pause
+  fi
+  return 0
 }
 
 one_click_run(){
-  # Jalankan berurutan
-  deps_menu
-  test_connect_menu
-  detect_webroot_menu
-  detect_db_menu
-  migrate_files_menu
-  import_db_menu
-  nginx_menu
-  finalize_menu
+  if ! ensure_source_connection_ready; then
+    pause
+    return
+  fi
+
+  if ! deps_menu --auto; then
+    err "Langkah dependencies gagal. Periksa menu 1."
+    pause
+    return
+  fi
+
+  if ! test_connect_menu --auto; then
+    err "Tes SSH gagal. Pastikan kredensial benar di menu 2."
+    pause
+    return
+  fi
+
+  if ! detect_webroot_menu --auto; then
+    err "Deteksi webroot gagal. Jalankan menu 6 secara manual."
+    pause
+    return
+  fi
+
+  if ! detect_db_menu --auto; then
+    err "Deteksi database gagal. Periksa menu 7."
+    pause
+    return
+  fi
+
+  if ! migrate_files_menu --auto; then
+    err "Penarikan file gagal. Coba ulang dari menu 8."
+    pause
+    return
+  fi
+
+  if ! import_db_menu --auto; then
+    err "Import database gagal. Coba ulang dari menu 9."
+    pause
+    return
+  fi
+
+  if ! nginx_menu --auto; then
+    err "Penulisan block Nginx gagal. Revisi di menu 10."
+    pause
+    return
+  fi
+
+  if ! finalize_menu --auto; then
+    err "Finalize gagal. Jalankan menu 11 untuk detail."
+    pause
+    return
+  fi
+
+  notify "ONE-CLICK selesai tanpa error kritis."
+  pause
 }
 
 # ====== UI ======
@@ -422,32 +769,37 @@ main_menu(){
     echo "Auth      : $( [[ -n "$SSHPASS" ]] && echo 'PASSWORD/sshpass' || echo 'SSH KEY (BatchMode)')"
     echo "Log file  : $LOG_FILE"
     echo "-------------------------------------------------------------------------"
+    if [[ -z "$SRC_HOST" || -z "$SUBDOMAIN" ]]; then
+      echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
+    fi
     echo " 1) Dependencies Check"
-    echo " 2) New Profile"
-    echo " 3) Load Profile"
-    echo " 4) Test SSH Connectivity"
-    echo " 5) Detect Webroot (Nginx)"
-    echo " 6) Detect DB (wp-config.php)"
-    echo " 7) Migrate Files"
-    echo " 8) Import Database"
-    echo " 9) Write Nginx Block"
-    echo "10) Finalize (Ownership + Reload)"
-    echo "11) ONE-CLICK RUN (1→10)"
+    echo " 2) Set Source Connection (Quick)"
+    echo " 3) New Profile"
+    echo " 4) Load Profile"
+    echo " 5) Test SSH Connectivity"
+    echo " 6) Detect Webroot (Nginx)"
+    echo " 7) Detect DB (wp-config.php)"
+    echo " 8) Migrate Files"
+    echo " 9) Import Database"
+    echo "10) Write Nginx Block"
+    echo "11) Finalize (Ownership + Reload)"
+    echo "12) ONE-CLICK RUN (Deps→Finalize)"
     echo " 0) Exit"
     echo "-------------------------------------------------------------------------"
-    read -r -p "Pilih menu [0-11]: " ans
+    read -r -p "Pilih menu [0-12]: " ans
     case "$ans" in
       1) deps_menu ;;
-      2) new_profile_menu ;;
-      3) load_profile_menu ;;
-      4) test_connect_menu ;;
-      5) detect_webroot_menu ;;
-      6) detect_db_menu ;;
-      7) migrate_files_menu ;;
-      8) import_db_menu ;;
-      9) nginx_menu ;;
-     10) finalize_menu ;;
-     11) one_click_run ;;
+      2) source_connection_menu ;;
+      3) new_profile_menu ;;
+      4) load_profile_menu ;;
+      5) test_connect_menu ;;
+      6) detect_webroot_menu ;;
+      7) detect_db_menu ;;
+      8) migrate_files_menu ;;
+      9) import_db_menu ;;
+     10) nginx_menu ;;
+     11) finalize_menu ;;
+     12) one_click_run ;;
       0) exit 0 ;;
       *) echo "Pilihan tidak dikenal"; pause ;;
     esac
