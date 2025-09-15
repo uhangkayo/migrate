@@ -62,10 +62,10 @@ notify(){ command -v notify-send >/dev/null 2>&1 && notify-send "Migration Menu"
 # ====== SSH wrappers (sentinel) ======
 build_ssh_base(){
   if [[ -n "$SSHPASS" ]]; then
-    printf "sshpass -p '%s' ssh -T -q -p %s -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new %s@%s" \
+    printf "sshpass -p '%s' ssh -T -q -p %s -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
       "$(printf "%s" "$SSHPASS")" "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
   else
-    printf "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s@%s" \
+    printf "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
       "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
   fi
 }
@@ -75,12 +75,14 @@ remote_marked(){
   local ssh_cmd; ssh_cmd="$(build_ssh_base)"
   # shellcheck disable=SC2016
   eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; ( $cmd ) 2>/dev/null; printf __END__' " \
+    2> >(grep -v 'TERM environment variable not set' >&2) \
     | sed -n '/__BEGIN__/,/__END__/p' | sed -e '1d' -e '$d'
 }
 
 ssh_check(){
   local ssh_cmd; ssh_cmd="$(build_ssh_base)"
   eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; echo ok; printf __END__' " \
+    2> >(grep -v 'TERM environment variable not set' >&2) \
     | sed -n 's/^.*__BEGIN__\(.*\)__END__.*$/\1/p' | grep -q '^ok$'
 }
 
@@ -237,9 +239,11 @@ remote_subdomain_menu(){
   fi
 }
 
+
 # ====== Steps ======
 deps_menu(){
   local mode="${1:-}" auto=0
+
   [[ "$mode" == "--auto" ]] && auto=1
 
   echo "Memeriksa dependencies..."
@@ -322,6 +326,7 @@ source_connection_menu(){
   read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
   test_now="${test_now:-Y}"
   if [[ "$test_now" =~ ^[Yy]$ ]]; then
+
     test_connect_menu
   else
     pause
@@ -370,6 +375,7 @@ source_connection_menu(){
   if [[ "$test_now" =~ ^[Yy]$ ]]; then
     test_connect_menu
   else
+
     pause
   fi
 }
@@ -424,6 +430,7 @@ load_profile_menu(){
 
 test_connect_menu(){
 
+
   local skip_pause="${1:-0}"
   if [[ -z "$SRC_HOST" ]]; then
     err "Profil belum lengkap (SRC_HOST kosong)"
@@ -439,6 +446,7 @@ test_connect_menu(){
   if ssh_check; then
     notify "✅ SSH non-interaktif OK"
 
+
     remote_subdomain_menu
 
   else
@@ -450,6 +458,7 @@ test_connect_menu(){
     if [[ $auto -ne 1 ]]; then pause; fi
     return 1
   fi
+
 
 
   if [[ "$skip_pause" != "1" ]]; then
@@ -488,6 +497,7 @@ detect_webroot_menu(){
 }
 
 detect_db_menu(){
+
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
@@ -551,6 +561,7 @@ detect_db_menu(){
 }
 
 migrate_files_menu(){
+
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
@@ -603,6 +614,7 @@ migrate_files_menu(){
 }
 
 import_db_menu(){
+
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
@@ -651,6 +663,7 @@ import_db_menu(){
 }
 
 nginx_menu(){
+
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
@@ -715,6 +728,7 @@ CONF
 }
 
 finalize_menu(){
+
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
 
@@ -804,9 +818,7 @@ main_menu(){
       echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
     fi
     echo " 1) Dependencies Check"
-
     echo " 2) Set Source Connection"
-
     echo " 3) New Profile"
     echo " 4) Load Profile"
     echo " 5) Test SSH Connectivity"
