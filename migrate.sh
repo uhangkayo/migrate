@@ -164,6 +164,79 @@ list_profiles(){
   ls -1 "$PROFILE_DIR" 2>/dev/null | sed 's/\.conf$//' || true
 }
 
+remote_subdomains_fetch(){
+  local cmd
+  cmd=$(cat <<'CMD'
+(
+  for path in /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available; do
+    if [ -d "$path" ]; then
+      grep -RhoE "server_name[[:space:]]+[^;#]*" "$path" 2>/dev/null
+    fi
+  done
+) | awk "{for (i=2; i<=NF; i++) {gsub(/;$/,"", $i); if (length($i) > 0 && index($i, ".") > 0) print $i;}}" | sort -u
+CMD
+  )
+  remote_marked "$cmd" | tr -d '\r' | sed '/^[[:space:]]*$/d'
+}
+
+remote_subdomain_menu(){
+  log "Mengambil daftar subdomain (server_name) dari SOURCE..."
+  local raw; raw="$(remote_subdomains_fetch || true)"
+  raw="$(printf '%s\n' "$raw" | sed '/^[[:space:]]*$/d')"
+  if [[ -z "$raw" ]]; then
+    warn "Tidak menemukan daftar subdomain dari konfigurasi Nginx SOURCE."
+    return
+  fi
+
+  local -a subdomain_list=()
+  mapfile -t subdomain_list <<<"$raw"
+  if [[ ${#subdomain_list[@]} -eq 0 ]]; then
+    warn "Daftar subdomain kosong."
+    return
+  fi
+
+  echo "==================== DAFTAR SUBDOMAIN SOURCE ===================="
+  local idx
+  for idx in "${!subdomain_list[@]}"; do
+    printf " %2d) %s\n" "$((idx + 1))" "${subdomain_list[$idx]}"
+  done
+  echo "-----------------------------------------------------------------"
+  local selection
+  read -r -p "Pilih nomor untuk set SUBDOMAIN atau ketik manual (Enter=skip): " selection || true
+
+  if [[ "$selection" =~ ^[0-9]+$ ]]; then
+    local index=$((selection - 1))
+    if (( index >= 0 && index < ${#subdomain_list[@]} )); then
+      local chosen="${subdomain_list[$index]}"
+      chosen="$(sanitize "$chosen")"
+      if [[ -n "$chosen" ]]; then
+        SUBDOMAIN="$chosen"
+        DST_WEBROOT="/var/www/${SUBDOMAIN}"
+        SRC_WEBROOT=""
+        notify "SUBDOMAIN di-set ke $SUBDOMAIN (DST webroot direset ke default)."
+        save_profile
+      fi
+    else
+      warn "Nomor di luar jangkauan daftar subdomain."
+    fi
+    return
+  fi
+
+  if [[ -n "$selection" ]]; then
+    local manual
+    manual="$(sanitize "$selection")"
+    if [[ -n "$manual" ]]; then
+      SUBDOMAIN="$manual"
+      DST_WEBROOT="/var/www/${SUBDOMAIN}"
+      SRC_WEBROOT=""
+      notify "SUBDOMAIN di-set ke $SUBDOMAIN (input manual)."
+      save_profile
+    else
+      warn "Input manual kosong setelah disanitasi."
+    fi
+  fi
+}
+
 # ====== Steps ======
 deps_menu(){
   echo "Memeriksa dependencies..."
@@ -181,13 +254,72 @@ deps_menu(){
   pause
 }
 
+source_connection_menu(){
+  echo "Konfigurasi koneksi SOURCE (server lama). Kosongkan untuk mempertahankan nilai saat ini."
+  local input usepass default_usepass test_now
+
+  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
+  if [[ -n "$input" ]]; then
+    SRC_HOST="$input"
+  fi
+
+  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
+  SRC_USER="${input:-${SRC_USER:-root}}"
+
+  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
+  SRC_PORT="${input:-${SRC_PORT:-22}}"
+
+  default_usepass="N"
+  [[ -n "$SSHPASS" ]] && default_usepass="Y"
+  read -r -p "Gunakan password/sshpass? (y/N) [$default_usepass]: " usepass
+  usepass="${usepass:-$default_usepass}"
+
+  if [[ "$usepass" =~ ^[Yy]$ ]]; then
+    if need sshpass; then
+      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
+    else
+      warn "sshpass belum ada; install dulu di menu Dependencies."
+      SSHPASS=""
+    fi
+  else
+    SSHPASS=""
+  fi
+
+  if [[ -z "$SRC_HOST" ]]; then
+    warn "SRC_HOST masih kosong. Lengkapi sebelum melanjutkan."
+  fi
+
+  [[ -n "$SUBDOMAIN" ]] && save_profile
+
+  read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
+  test_now="${test_now:-Y}"
+  if [[ "$test_now" =~ ^[Yy]$ ]]; then
+    test_connect_menu
+  else
+    pause
+  fi
+}
+
 new_profile_menu(){
+  local input usepass default_usepass
   read -r -p "Sub-domain (mis: blog.domain.com): " SUBDOMAIN
   SUBDOMAIN="$(sanitize "$SUBDOMAIN")"
-  read -r -p "IP/Host server LAMA (SOURCE): " SRC_HOST
-  read -r -p "User SSH SOURCE [root]: " SRC_USER; SRC_USER="${SRC_USER:-root}"
-  read -r -p "Port SSH SOURCE [22]: " SRC_PORT; SRC_PORT="${SRC_PORT:-22}"
-  read -r -p "Pakai password (y/N)? Jika y, akan diminta password setelah tes koneksi: " usepass; usepass="${usepass:-N}"
+
+  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
+  if [[ -n "$input" ]]; then
+    SRC_HOST="$input"
+  fi
+
+  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
+  SRC_USER="${input:-${SRC_USER:-root}}"
+
+  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
+  SRC_PORT="${input:-${SRC_PORT:-22}}"
+
+  default_usepass="N"
+  [[ -n "$SSHPASS" ]] && default_usepass="Y"
+  read -r -p "Pakai password (y/N)? Jika y, akan diminta password setelah tes koneksi [$default_usepass]: " usepass
+  usepass="${usepass:-$default_usepass}"
 
   DST_WEBROOT="/var/www/${SUBDOMAIN}"
   SRC_WEBROOT=""   # biarkan auto
@@ -198,6 +330,7 @@ new_profile_menu(){
       read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
     else
       warn "sshpass belum ada; install dulu di menu Dependencies."
+      SSHPASS=""
     fi
   else
     SSHPASS=""
@@ -216,10 +349,20 @@ load_profile_menu(){
 }
 
 test_connect_menu(){
-  [[ -n "$SUBDOMAIN" && -n "$SRC_HOST" ]] || { err "Profil belum lengkap"; pause; return; }
+  local skip_pause="${1:-0}"
+  if [[ -z "$SRC_HOST" ]]; then
+    err "Profil belum lengkap (SRC_HOST kosong)"
+    [[ "$skip_pause" == "1" ]] || pause
+    return
+  fi
+
+  SRC_USER="${SRC_USER:-root}"
+  SRC_PORT="${SRC_PORT:-22}"
+
   log "Tes koneksi SSH ke $SRC_USER@$SRC_HOST:$SRC_PORT ..."
   if ssh_check; then
     notify "✅ SSH non-interaktif OK"
+    remote_subdomain_menu
   else
     if [[ -z "$SSHPASS" ]]; then
       warn "SSH key tidak bekerja. Opsi: jalankan 'ssh-copy-id -p $SRC_PORT $SRC_USER@$SRC_HOST' atau set SSHPASS + install sshpass."
@@ -227,7 +370,10 @@ test_connect_menu(){
       warn "SSH pass mungkin salah atau root login ditolak oleh SOURCE."
     fi
   fi
-  pause
+
+  if [[ "$skip_pause" != "1" ]]; then
+    pause
+  fi
 }
 
 detect_webroot_menu(){
@@ -423,31 +569,33 @@ main_menu(){
     echo "Log file  : $LOG_FILE"
     echo "-------------------------------------------------------------------------"
     echo " 1) Dependencies Check"
-    echo " 2) New Profile"
-    echo " 3) Load Profile"
-    echo " 4) Test SSH Connectivity"
-    echo " 5) Detect Webroot (Nginx)"
-    echo " 6) Detect DB (wp-config.php)"
-    echo " 7) Migrate Files"
-    echo " 8) Import Database"
-    echo " 9) Write Nginx Block"
-    echo "10) Finalize (Ownership + Reload)"
-    echo "11) ONE-CLICK RUN (1→10)"
+    echo " 2) Set Source Connection"
+    echo " 3) New Profile"
+    echo " 4) Load Profile"
+    echo " 5) Test SSH Connectivity"
+    echo " 6) Detect Webroot (Nginx)"
+    echo " 7) Detect DB (wp-config.php)"
+    echo " 8) Migrate Files"
+    echo " 9) Import Database"
+    echo "10) Write Nginx Block"
+    echo "11) Finalize (Ownership + Reload)"
+    echo "12) ONE-CLICK RUN (Deps→Finalize)"
     echo " 0) Exit"
     echo "-------------------------------------------------------------------------"
-    read -r -p "Pilih menu [0-11]: " ans
+    read -r -p "Pilih menu [0-12]: " ans
     case "$ans" in
       1) deps_menu ;;
-      2) new_profile_menu ;;
-      3) load_profile_menu ;;
-      4) test_connect_menu ;;
-      5) detect_webroot_menu ;;
-      6) detect_db_menu ;;
-      7) migrate_files_menu ;;
-      8) import_db_menu ;;
-      9) nginx_menu ;;
-     10) finalize_menu ;;
-     11) one_click_run ;;
+      2) source_connection_menu ;;
+      3) new_profile_menu ;;
+      4) load_profile_menu ;;
+      5) test_connect_menu ;;
+      6) detect_webroot_menu ;;
+      7) detect_db_menu ;;
+      8) migrate_files_menu ;;
+      9) import_db_menu ;;
+     10) nginx_menu ;;
+     11) finalize_menu ;;
+     12) one_click_run ;;
       0) exit 0 ;;
       *) echo "Pilihan tidak dikenal"; pause ;;
     esac
