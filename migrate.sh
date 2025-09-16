@@ -240,6 +240,7 @@ remote_subdomain_menu(){
 }
 
 
+
 # ====== Steps ======
 deps_menu(){
   local mode="${1:-}" auto=0
@@ -262,6 +263,7 @@ deps_menu(){
   else
     warn "Ada dependency yang belum lengkap."
   fi
+
 
   if [[ $auto -ne 1 ]]; then
     pause
@@ -326,6 +328,7 @@ source_connection_menu(){
   read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
   test_now="${test_now:-Y}"
   if [[ "$test_now" =~ ^[Yy]$ ]]; then
+
 
     test_connect_menu
   else
@@ -431,6 +434,7 @@ load_profile_menu(){
 test_connect_menu(){
 
 
+
   local skip_pause="${1:-0}"
   if [[ -z "$SRC_HOST" ]]; then
     err "Profil belum lengkap (SRC_HOST kosong)"
@@ -447,6 +451,7 @@ test_connect_menu(){
     notify "✅ SSH non-interaktif OK"
 
 
+
     remote_subdomain_menu
 
   else
@@ -455,6 +460,7 @@ test_connect_menu(){
     else
       warn "SSH pass mungkin salah atau root login ditolak oleh SOURCE."
     fi
+
     if [[ $auto -ne 1 ]]; then pause; fi
     return 1
   fi
@@ -490,6 +496,7 @@ detect_webroot_menu(){
     log "SOURCE webroot sudah di-set: $SRC_WEBROOT"
   fi
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -497,6 +504,7 @@ detect_webroot_menu(){
 }
 
 detect_db_menu(){
+
 
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
@@ -508,6 +516,7 @@ detect_db_menu(){
   fi
   if [[ "$WANT_DB" == "no" ]]; then
     warn "DB diset tidak akan dipindah (NO_DB)."
+
     if [[ $auto -ne 1 ]]; then pause; fi
     return 0
   fi
@@ -554,6 +563,7 @@ detect_db_menu(){
     WANT_DB="no"
     save_profile
   fi
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -561,6 +571,7 @@ detect_db_menu(){
 }
 
 migrate_files_menu(){
+
 
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
@@ -576,6 +587,7 @@ migrate_files_menu(){
   local est; est="$(remote_marked "du -sb \"$SRC_WEBROOT\" 2>/dev/null | awk '{print \$1}'" | tr -d '\r' || true)"
   [[ -z "${est:-}" ]] && est=0
   log "Perkiraan size SOURCE: $(bytes_to_h "$est")"
+
 
   if [[ $auto -eq 1 ]]; then
     FORCE_RSYNC="1"
@@ -607,6 +619,7 @@ migrate_files_menu(){
     notify "FILES selesai."
   fi
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -614,6 +627,7 @@ migrate_files_menu(){
 }
 
 import_db_menu(){
+
 
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
@@ -656,6 +670,7 @@ import_db_menu(){
     fi
   fi
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -663,6 +678,7 @@ import_db_menu(){
 }
 
 nginx_menu(){
+
 
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
@@ -681,6 +697,7 @@ nginx_menu(){
   if [[ "$yn" =~ ^[Nn]$ ]]; then
     NO_NGINX="1"
     save_profile
+
     if [[ $auto -ne 1 ]]; then pause; fi
     return 0
   fi
@@ -721,6 +738,7 @@ CONF
     status=1
   fi
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -728,6 +746,7 @@ CONF
 }
 
 finalize_menu(){
+
 
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
@@ -737,6 +756,7 @@ finalize_menu(){
   systemctl list-units | grep -Eo 'php[0-9.]+-fpm\.service' | sort -u | xargs -r -n1 systemctl reload || true
   notify "Selesai. Arahkan DNS A record ${SUBDOMAIN} ke IP server baru saat siap cutover."
   log "Log selesai: $LOG_FILE"
+
 
   if [[ $auto -ne 1 ]]; then
     pause
@@ -818,6 +838,7 @@ main_menu(){
       echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
     fi
     echo " 1) Dependencies Check"
+
     echo " 2) Set Source Connection"
     echo " 3) New Profile"
     echo " 4) Load Profile"
