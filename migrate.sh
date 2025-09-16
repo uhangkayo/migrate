@@ -70,12 +70,12 @@ build_ssh_base(){
   SSHPASS_FALLBACK="0"
   SSH_BASE_CMD=""
   if [[ -n "$SSHPASS" ]]; then
-    if command -v sshpass >/dev/null 2>&1; then
-      printf -v SSH_BASE_CMD "sshpass -p '%s' ssh -T -q -p %s -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
-        "$(printf "%s" "$SSHPASS")" "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
-      return 0
-    fi
-    SSHPASS_FALLBACK="1"
+
+    printf "sshpass -p '%s' ssh -T -q -p %s -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
+      "$(printf "%s" "$SSHPASS")" "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
+  else
+    printf "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
+      "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
   fi
   printf -v SSH_BASE_CMD "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
     "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
@@ -93,32 +93,11 @@ remote_marked(){
 }
 
 ssh_check(){
-  local ssh_cmd tmp_err raw status filtered
-  build_ssh_base
-  ssh_cmd="$SSH_BASE_CMD"
-  tmp_err="$(mktemp)"
-  raw=$(eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; echo ok; printf __END__' " \
-    2> >(grep -v 'TERM environment variable not set' | tee "$tmp_err" >&2))
-  status=$?
-  filtered="$(sed 's/\r$//' "$tmp_err" | sed '/^[[:space:]]*$/d' | tail -n1)"
-  rm -f "$tmp_err"
 
-  if [[ $status -ne 0 ]]; then
-    SSH_LAST_STATUS=$status
-    SSH_LAST_ERROR="$filtered"
-    return 1
-  fi
-
-  raw=$(printf '%s\n' "$raw" | sed -n 's/^.*__BEGIN__\(.*\)__END__.*$/\1/p')
-  if [[ "$raw" == "ok" ]]; then
-    SSH_LAST_STATUS=0
-    SSH_LAST_ERROR=""
-    return 0
-  fi
-
-  SSH_LAST_STATUS=1
-  SSH_LAST_ERROR="Respon SSH tidak memuat sentinel __BEGIN__/__END__."
-  return 1
+  local ssh_cmd; ssh_cmd="$(build_ssh_base)"
+  eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; echo ok; printf __END__' " \
+    2> >(grep -v 'TERM environment variable not set' >&2) \
+    | sed -n 's/^.*__BEGIN__\(.*\)__END__.*$/\1/p' | grep -q '^ok$'
 }
 
 # ====== rsync/tar ======
@@ -271,27 +250,14 @@ remote_subdomain_menu(){
   fi
 }
 
-ensure_source_connection_ready(){
-  local -a missing=()
-  [[ -n "$SRC_HOST" ]] || missing+=("SRC_HOST")
-  [[ -n "$SRC_USER" ]] || missing+=("SRC_USER")
-  [[ -n "$SRC_PORT" ]] || missing+=("SRC_PORT")
-  [[ -n "$SUBDOMAIN" ]] || missing+=("SUBDOMAIN")
 
-  if (( ${#missing[@]} > 0 )); then
-    err "Profil belum lengkap: ${missing[*]}. Jalankan menu '2) Set Source Connection (Quick)'."
-    return 1
-  fi
-  return 0
-}
+
 
 # ====== Steps ======
 deps_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+  local mode="${1:-}" auto=0
+
+  [[ "$mode" == "--auto" ]] && auto=1
 
   echo "Memeriksa dependencies..."
   local missing=0
@@ -310,7 +276,9 @@ deps_menu(){
     warn "Ada dependency yang belum lengkap."
   fi
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return $missing
@@ -373,10 +341,56 @@ source_connection_menu(){
   read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
   test_now="${test_now:-Y}"
   if [[ "$test_now" =~ ^[Yy]$ ]]; then
-    if ! test_connect_menu; then
-      warn "Tes koneksi gagal. Periksa kembali host/user/password sebelum melanjutkan."
+
+    test_connect_menu
+  else
+    pause
+  fi
+}
+
+source_connection_menu(){
+  echo "Konfigurasi koneksi SOURCE (server lama). Kosongkan untuk mempertahankan nilai saat ini."
+  local input usepass default_usepass test_now
+
+  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
+  if [[ -n "$input" ]]; then
+    SRC_HOST="$input"
+  fi
+
+  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
+  SRC_USER="${input:-${SRC_USER:-root}}"
+
+  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
+  SRC_PORT="${input:-${SRC_PORT:-22}}"
+
+  default_usepass="N"
+  [[ -n "$SSHPASS" ]] && default_usepass="Y"
+  read -r -p "Gunakan password/sshpass? (y/N) [$default_usepass]: " usepass
+  usepass="${usepass:-$default_usepass}"
+
+  if [[ "$usepass" =~ ^[Yy]$ ]]; then
+    if need sshpass; then
+      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
+    else
+      warn "sshpass belum ada; install dulu di menu Dependencies."
+      SSHPASS=""
     fi
   else
+    SSHPASS=""
+  fi
+
+  if [[ -z "$SRC_HOST" ]]; then
+    warn "SRC_HOST masih kosong. Lengkapi sebelum melanjutkan."
+  fi
+
+  [[ -n "$SUBDOMAIN" ]] && save_profile
+
+  read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
+  test_now="${test_now:-Y}"
+  if [[ "$test_now" =~ ^[Yy]$ ]]; then
+    test_connect_menu
+  else
+
     pause
   fi
 }
@@ -430,16 +444,14 @@ load_profile_menu(){
 }
 
 test_connect_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
 
+
+  local skip_pause="${1:-0}"
   if [[ -z "$SRC_HOST" ]]; then
     err "Profil belum lengkap (SRC_HOST kosong)"
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
-    return 1
+    [[ "$skip_pause" == "1" ]] || pause
+    return
+
   fi
 
   SRC_USER="${SRC_USER:-root}"
@@ -448,11 +460,9 @@ test_connect_menu(){
   log "Tes koneksi SSH ke $SRC_USER@$SRC_HOST:$SRC_PORT ..."
   if ssh_check; then
     notify "✅ SSH non-interaktif OK"
-    if [[ "${auto_mode:-0}" -eq 1 ]]; then
-      log "Mode auto: lewati pemilihan subdomain interaktif."
-    else
-      remote_subdomain_menu
-    fi
+
+    remote_subdomain_menu
+
   else
     if [[ "$SSHPASS_FALLBACK" == "1" ]]; then
       if [[ "$SSHPASS_WARNED" != "1" ]]; then
@@ -484,26 +494,26 @@ test_connect_menu(){
     if [[ -n "$SSH_LAST_ERROR" ]]; then
       warn "Detail SSH: $SSH_LAST_ERROR"
     fi
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
+
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 1
   fi
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+
+  if [[ "$skip_pause" != "1" ]]; then
     pause
   fi
-  return 0
+
 }
 
 detect_webroot_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ -z "$SUBDOMAIN" || -z "$SRC_HOST" ]]; then
     err "Profil belum lengkap"
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 1
   fi
 
@@ -520,27 +530,27 @@ detect_webroot_menu(){
     log "SOURCE webroot sudah di-set: $SRC_WEBROOT"
   fi
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return 0
 }
 
 detect_db_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ -z "$SRC_WEBROOT" ]]; then
     err "Set/deteksi webroot dulu"
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 1
   fi
   if [[ "$WANT_DB" == "no" ]]; then
     warn "DB diset tidak akan dipindah (NO_DB)."
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
+
+
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 0
   fi
 
@@ -586,22 +596,24 @@ detect_db_menu(){
     WANT_DB="no"
     save_profile
   fi
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return 0
 }
 
 migrate_files_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+
+
+
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ -z "$SUBDOMAIN" || -z "$SRC_WEBROOT" ]]; then
     err "Profil belum lengkap (subdomain/webroot)"
-    if [[ "$auto_mode" -ne 1 ]]; then pause; fi
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 1
   fi
   DST_WEBROOT="${DST_WEBROOT:-/var/www/${SUBDOMAIN}}"
@@ -611,7 +623,9 @@ migrate_files_menu(){
   [[ -z "${est:-}" ]] && est=0
   log "Perkiraan size SOURCE: $(bytes_to_h "$est")"
 
-  if [[ "${auto_mode:-0}" -eq 1 ]]; then
+
+
+  if [[ $auto -eq 1 ]]; then
     FORCE_RSYNC="1"
     DRY_RUN="0"
   else
@@ -641,22 +655,24 @@ migrate_files_menu(){
     notify "FILES selesai."
   fi
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return $status
 }
 
 import_db_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+
+
+
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
 
   if [[ "$WANT_DB" != "yes" || -z "${DB_NAME:-}" ]]; then
     warn "Import DB dilewati (tidak terdeteksi atau dinonaktifkan)."
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 0
   fi
 
@@ -684,6 +700,7 @@ import_db_menu(){
     notify "Import DB selesai → target: $T_DB (user=$T_USER)"
     save_profile
 
+
     # Patch wp-config.php target (jika ada)
     if [[ -f "$DST_WEBROOT/wp-config.php" ]]; then
       sed -ri "s/define\('DB_NAME',[[:space:]]*'[^']*'\)/define('DB_NAME', '$T_DB')/" "$DST_WEBROOT/wp-config.php" || true
@@ -692,21 +709,22 @@ import_db_menu(){
     fi
   fi
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return $status
 }
 
 nginx_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+
+
+
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
 
   local yn
-  if [[ "${auto_mode:-0}" -eq 1 ]]; then
+  if [[ $auto -eq 1 ]]; then
     if [[ "$NO_NGINX" == "1" ]]; then
       log "Mode auto: konfigurasi Nginx dilewati karena NO_NGINX=1."
       return 0
@@ -719,7 +737,9 @@ nginx_menu(){
   if [[ "$yn" =~ ^[Nn]$ ]]; then
     NO_NGINX="1"
     save_profile
-    if [[ "${auto_mode:-0}" -ne 1 ]]; then pause; fi
+
+
+    if [[ $auto -ne 1 ]]; then pause; fi
     return 0
   fi
   NO_NGINX="0"
@@ -759,18 +779,20 @@ CONF
     status=1
   fi
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return $status
 }
 
 finalize_menu(){
-  local mode="${1:-}"
-  local auto_mode=0
-  if [[ "$mode" == "--auto" ]]; then
-    auto_mode=1
-  fi
+
+
+
+  local mode="${1:-}" auto=0
+  [[ "$mode" == "--auto" ]] && auto=1
 
   [[ -z "$DST_WEBROOT" ]] && DST_WEBROOT="/var/www/${SUBDOMAIN}"
   chown -R www-data:www-data "$DST_WEBROOT" || true
@@ -778,7 +800,9 @@ finalize_menu(){
   notify "Selesai. Arahkan DNS A record ${SUBDOMAIN} ke IP server baru saat siap cutover."
   log "Log selesai: $LOG_FILE"
 
-  if [[ "${auto_mode:-0}" -ne 1 ]]; then
+
+
+  if [[ $auto -ne 1 ]]; then
     pause
   fi
   return 0
@@ -858,7 +882,9 @@ main_menu(){
       echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
     fi
     echo " 1) Dependencies Check"
-    echo " 2) Set Source Connection (Quick)"
+
+
+    echo " 2) Set Source Connection"
     echo " 3) New Profile"
     echo " 4) Load Profile"
     echo " 5) Test SSH Connectivity"
@@ -873,18 +899,18 @@ main_menu(){
     echo "-------------------------------------------------------------------------"
     read -r -p "Pilih menu [0-12]: " ans
     case "$ans" in
-      1) deps_menu || true ;;
-      2) source_connection_menu || true ;;
-      3) new_profile_menu || true ;;
-      4) load_profile_menu || true ;;
-      5) test_connect_menu || true ;;
-      6) detect_webroot_menu || true ;;
-      7) detect_db_menu || true ;;
-      8) migrate_files_menu || true ;;
-      9) import_db_menu || true ;;
-     10) nginx_menu || true ;;
-     11) finalize_menu || true ;;
-     12) one_click_run || true ;;
+      1) deps_menu ;;
+      2) source_connection_menu ;;
+      3) new_profile_menu ;;
+      4) load_profile_menu ;;
+      5) test_connect_menu ;;
+      6) detect_webroot_menu ;;
+      7) detect_db_menu ;;
+      8) migrate_files_menu ;;
+      9) import_db_menu ;;
+     10) nginx_menu ;;
+     11) finalize_menu ;;
+     12) one_click_run ;;
       0) exit 0 ;;
       *) echo "Pilihan tidak dikenal"; pause ;;
     esac
