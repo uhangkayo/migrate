@@ -41,6 +41,12 @@ NO_NGINX="0"                 # 1=skip tulis nginx
 DRY_RUN="0"                  # 1=rsync dry-run
 FORCE_RSYNC="1"              # 1=rsync, 0=tar
 
+SSH_LAST_STATUS=0
+SSH_LAST_ERROR=""
+SSHPASS_WARNED="0"
+SSHPASS_FALLBACK="0"
+SSH_BASE_CMD=""
+
 # ====== Helpers ======
 log()   { printf "[%s] %s\n" "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 warn()  { printf "\033[33mWARN:\033[0m %s\n" "$*" | tee -a "$LOG_FILE"; }
@@ -61,18 +67,25 @@ notify(){ command -v notify-send >/dev/null 2>&1 && notify-send "Migration Menu"
 
 # ====== SSH wrappers (sentinel) ======
 build_ssh_base(){
+  SSHPASS_FALLBACK="0"
+  SSH_BASE_CMD=""
   if [[ -n "$SSHPASS" ]]; then
+
     printf "sshpass -p '%s' ssh -T -q -p %s -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
       "$(printf "%s" "$SSHPASS")" "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
   else
     printf "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
       "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
   fi
+  printf -v SSH_BASE_CMD "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
+    "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
+  return 0
 }
 
 remote_marked(){
   local cmd="$1"
-  local ssh_cmd; ssh_cmd="$(build_ssh_base)"
+  build_ssh_base
+  local ssh_cmd="$SSH_BASE_CMD"
   # shellcheck disable=SC2016
   eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; ( $cmd ) 2>/dev/null; printf __END__' " \
     2> >(grep -v 'TERM environment variable not set' >&2) \
@@ -80,6 +93,7 @@ remote_marked(){
 }
 
 ssh_check(){
+
   local ssh_cmd; ssh_cmd="$(build_ssh_base)"
   eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; echo ok; printf __END__' " \
     2> >(grep -v 'TERM environment variable not set' >&2) \
@@ -99,12 +113,8 @@ rsync_opts_build(){
 rsync_pull(){
   local src="$1" dst="$2"
   local opts; opts="$(rsync_opts_build)"
-  local ssh_tun
-  if [[ -n "$SSHPASS" ]]; then
-    ssh_tun="sshpass -p '$SSHPASS' ssh -T -q -p $SRC_PORT -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new"
-  else
-    ssh_tun="ssh -T -q -p $SRC_PORT -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-  fi
+  build_ssh_base
+  local ssh_tun="$SSH_BASE_CMD"
   mkdir -p "$dst"
   if [[ "$DRY_RUN" == "1" ]]; then
     # shellcheck disable=SC2086
@@ -116,7 +126,8 @@ rsync_pull(){
 
 tar_pull(){
   local src_dir="$1" dst_dir="$2"
-  local ssh_cmd; ssh_cmd="$(build_ssh_base)"
+  build_ssh_base
+  local ssh_cmd="$SSH_BASE_CMD"
   mkdir -p "$dst_dir"
   if command -v pigz >/dev/null 2>&1; then
     eval "$ssh_cmd 'tar -C \"$(dirname "$src_dir")\" -cpf - \"$(basename "$src_dir")\" | pigz -1'" | pigz -d | tar -C "$dst_dir/.." -xpf -
@@ -241,6 +252,7 @@ remote_subdomain_menu(){
 
 
 
+
 # ====== Steps ======
 deps_menu(){
   local mode="${1:-}" auto=0
@@ -263,6 +275,7 @@ deps_menu(){
   else
     warn "Ada dependency yang belum lengkap."
   fi
+
 
 
   if [[ $auto -ne 1 ]]; then
@@ -328,7 +341,6 @@ source_connection_menu(){
   read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
   test_now="${test_now:-Y}"
   if [[ "$test_now" =~ ^[Yy]$ ]]; then
-
 
     test_connect_menu
   else
@@ -434,7 +446,6 @@ load_profile_menu(){
 test_connect_menu(){
 
 
-
   local skip_pause="${1:-0}"
   if [[ -z "$SRC_HOST" ]]; then
     err "Profil belum lengkap (SRC_HOST kosong)"
@@ -450,15 +461,38 @@ test_connect_menu(){
   if ssh_check; then
     notify "✅ SSH non-interaktif OK"
 
-
-
     remote_subdomain_menu
 
   else
-    if [[ -z "$SSHPASS" ]]; then
-      warn "SSH key tidak bekerja. Opsi: jalankan 'ssh-copy-id -p $SRC_PORT $SRC_USER@$SRC_HOST' atau set SSHPASS + install sshpass."
+    if [[ "$SSHPASS_FALLBACK" == "1" ]]; then
+      if [[ "$SSHPASS_WARNED" != "1" ]]; then
+        err "SSHPASS diisi tetapi utilitas 'sshpass' belum terpasang. Install sshpass atau kosongkan password untuk memakai SSH key."
+        SSHPASS_WARNED="1"
+      fi
+    elif [[ -n "$SSHPASS" ]]; then
+      case "$SSH_LAST_STATUS" in
+        5|6)
+          warn "Autentikasi password gagal (kode $SSH_LAST_STATUS). Pastikan password benar dan root login diizinkan."
+          ;;
+        255)
+          warn "Tidak bisa membuka koneksi ke $SRC_HOST:$SRC_PORT. Periksa firewall, IP, atau konfirmasi fingerprint host (misal server Lempzy)."
+          ;;
+        *)
+          warn "SSH pass mungkin salah atau root login ditolak oleh SOURCE (exit $SSH_LAST_STATUS)."
+          ;;
+      esac
     else
-      warn "SSH pass mungkin salah atau root login ditolak oleh SOURCE."
+      case "$SSH_LAST_STATUS" in
+        255)
+          warn "Tidak bisa membuka koneksi ke $SRC_HOST:$SRC_PORT. Firewall, IP salah, atau butuh approve fingerprint manual."
+          ;;
+        *)
+          warn "SSH key tidak bekerja. Opsi: jalankan 'ssh-copy-id -p $SRC_PORT $SRC_USER@$SRC_HOST' atau set SSHPASS + install sshpass."
+          ;;
+      esac
+    fi
+    if [[ -n "$SSH_LAST_ERROR" ]]; then
+      warn "Detail SSH: $SSH_LAST_ERROR"
     fi
 
     if [[ $auto -ne 1 ]]; then pause; fi
@@ -496,7 +530,6 @@ detect_webroot_menu(){
     log "SOURCE webroot sudah di-set: $SRC_WEBROOT"
   fi
 
-
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -504,7 +537,6 @@ detect_webroot_menu(){
 }
 
 detect_db_menu(){
-
 
   local mode="${1:-}" auto=0
   [[ "$mode" == "--auto" ]] && auto=1
@@ -516,6 +548,7 @@ detect_db_menu(){
   fi
   if [[ "$WANT_DB" == "no" ]]; then
     warn "DB diset tidak akan dipindah (NO_DB)."
+
 
     if [[ $auto -ne 1 ]]; then pause; fi
     return 0
@@ -564,6 +597,7 @@ detect_db_menu(){
     save_profile
   fi
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -571,6 +605,7 @@ detect_db_menu(){
 }
 
 migrate_files_menu(){
+
 
 
   local mode="${1:-}" auto=0
@@ -587,6 +622,7 @@ migrate_files_menu(){
   local est; est="$(remote_marked "du -sb \"$SRC_WEBROOT\" 2>/dev/null | awk '{print \$1}'" | tr -d '\r' || true)"
   [[ -z "${est:-}" ]] && est=0
   log "Perkiraan size SOURCE: $(bytes_to_h "$est")"
+
 
 
   if [[ $auto -eq 1 ]]; then
@@ -620,6 +656,7 @@ migrate_files_menu(){
   fi
 
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -627,6 +664,7 @@ migrate_files_menu(){
 }
 
 import_db_menu(){
+
 
 
   local mode="${1:-}" auto=0
@@ -662,6 +700,7 @@ import_db_menu(){
     notify "Import DB selesai → target: $T_DB (user=$T_USER)"
     save_profile
 
+
     # Patch wp-config.php target (jika ada)
     if [[ -f "$DST_WEBROOT/wp-config.php" ]]; then
       sed -ri "s/define\('DB_NAME',[[:space:]]*'[^']*'\)/define('DB_NAME', '$T_DB')/" "$DST_WEBROOT/wp-config.php" || true
@@ -678,6 +717,7 @@ import_db_menu(){
 }
 
 nginx_menu(){
+
 
 
   local mode="${1:-}" auto=0
@@ -697,6 +737,7 @@ nginx_menu(){
   if [[ "$yn" =~ ^[Nn]$ ]]; then
     NO_NGINX="1"
     save_profile
+
 
     if [[ $auto -ne 1 ]]; then pause; fi
     return 0
@@ -739,6 +780,7 @@ CONF
   fi
 
 
+
   if [[ $auto -ne 1 ]]; then
     pause
   fi
@@ -746,6 +788,7 @@ CONF
 }
 
 finalize_menu(){
+
 
 
   local mode="${1:-}" auto=0
@@ -756,6 +799,7 @@ finalize_menu(){
   systemctl list-units | grep -Eo 'php[0-9.]+-fpm\.service' | sort -u | xargs -r -n1 systemctl reload || true
   notify "Selesai. Arahkan DNS A record ${SUBDOMAIN} ke IP server baru saat siap cutover."
   log "Log selesai: $LOG_FILE"
+
 
 
   if [[ $auto -ne 1 ]]; then
@@ -838,6 +882,7 @@ main_menu(){
       echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
     fi
     echo " 1) Dependencies Check"
+
 
     echo " 2) Set Source Connection"
     echo " 3) New Profile"
