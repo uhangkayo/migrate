@@ -44,6 +44,8 @@ Menu:
   1) Export WordPress sites (run on old server)
   2) Import WordPress sites (run on new server)
   3) Clean login banner/MOTD on this machine
+  4) Delete backup files and archives
+  5) Full cleanup: remove all export/import data
   0) Exit
 USAGE
 }
@@ -94,6 +96,104 @@ clean_banner() {
   fi
   systemctl reload sshd 2>/dev/null || systemctl reload ssh || true
   ok "Login banners/MOTD disabled."
+}
+
+# Clean up backup files and directories. This function scans for
+# leftover `.sql.gz` / `.webroot.tar.gz` archives in EXPORT_DIR and IMPORT_DIR
+# as well as `.bak` directories in WEBROOT_BASE_IMPORT. It asks for confirmation
+# before deleting anything. Use this after export/import operations to
+# remove sensitive data.
+cleanup_backups() {
+  require_cmds_import || true  # ensure basic commands exist for find/ls
+  log "=== Cleanup backups ==="
+  local deleted_any=0
+  # Clean local export backups on this machine
+  if [[ -d "$EXPORT_DIR" ]]; then
+    # Find .sql.gz and .webroot.tar.gz files in EXPORT_DIR
+    mapfile -t __export_files < <(find "$EXPORT_DIR" -maxdepth 1 -type f \( -name '*.sql.gz' -o -name '*.webroot.tar.gz' \) 2>/dev/null)
+    if (( ${#__export_files[@]} )); then
+      log "File backup di $EXPORT_DIR yang ditemukan:"
+      for f in "${__export_files[@]}"; do printf "  - %s\n" "$(basename "$f")"; done
+      read -r -p "Hapus file backup ini dari $EXPORT_DIR? [y/N]: " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "${__export_files[@]}"
+        ok "Backup di $EXPORT_DIR dihapus"
+        deleted_any=1
+      fi
+    fi
+  fi
+  # Clean local import backups on this machine
+  if [[ -d "$IMPORT_DIR" ]]; then
+    mapfile -t __import_files < <(find "$IMPORT_DIR" -maxdepth 1 -type f \( -name '*.sql.gz' -o -name '*.webroot.tar.gz' \) 2>/dev/null)
+    if (( ${#__import_files[@]} )); then
+      log "File backup di $IMPORT_DIR yang ditemukan:"
+      for f in "${__import_files[@]}"; do printf "  - %s\n" "$(basename "$f")"; done
+      read -r -p "Hapus file backup ini dari $IMPORT_DIR? [y/N]: " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "${__import_files[@]}"
+        ok "Backup di $IMPORT_DIR dihapus"
+        deleted_any=1
+      fi
+    fi
+  fi
+  # Clean .bak directories under WEBROOT_BASE_IMPORT
+  if [[ -d "$WEBROOT_BASE_IMPORT" ]]; then
+    mapfile -t __bak_dirs < <(find "$WEBROOT_BASE_IMPORT" -maxdepth 2 -type d -name '*.bak' 2>/dev/null)
+    if (( ${#__bak_dirs[@]} )); then
+      log "Direktori backup (.bak) yang ditemukan di $WEBROOT_BASE_IMPORT:"
+      for d in "${__bak_dirs[@]}"; do printf "  - %s\n" "$d"; done
+      read -r -p "Hapus direktori backup ini? [y/N]: " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        rm -rf "${__bak_dirs[@]}"
+        ok "Direktori .bak dihapus"
+        deleted_any=1
+      fi
+    fi
+  fi
+  if (( deleted_any == 0 )); then
+    warn "Tidak ada file atau folder backup yang dihapus."
+  fi
+  read -r -p "Tekan Enter untuk kembali ke menu..." _
+}
+
+# Perform a full cleanup of export/import data. This will remove all
+# backup files in $EXPORT_DIR and $IMPORT_DIR as well as the export/import
+# directories themselves and any .bak directories under $WEBROOT_BASE_IMPORT.
+# Use this after you have completed migration to ensure no sensitive data is left.
+full_cleanup_all_data() {
+  require_cmds_import || true
+  log "=== Full cleanup of export/import data ==="
+  echo "Direktori yang akan dihapus (jika ada):"
+  echo "  EXPORT_DIR: $EXPORT_DIR"
+  echo "  IMPORT_DIR: $IMPORT_DIR"
+  echo "  .bak directories under: $WEBROOT_BASE_IMPORT"
+  read -r -p "Apakah Anda yakin ingin MENGHAPUS SEMUA data ini? [y/N]: " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    # Remove export and import directories safely
+    if [[ -d "$EXPORT_DIR" ]]; then
+      rm -rf "$EXPORT_DIR" && ok "$EXPORT_DIR dihapus" || warn "Gagal menghapus $EXPORT_DIR"
+    else
+      warn "$EXPORT_DIR tidak ada, lewati."
+    fi
+    if [[ -d "$IMPORT_DIR" ]]; then
+      rm -rf "$IMPORT_DIR" && ok "$IMPORT_DIR dihapus" || warn "Gagal menghapus $IMPORT_DIR"
+    else
+      warn "$IMPORT_DIR tidak ada, lewati."
+    fi
+    # Remove any .bak directories under WEBROOT_BASE_IMPORT
+    if [[ -d "$WEBROOT_BASE_IMPORT" ]]; then
+      mapfile -t bak_dirs < <(find "$WEBROOT_BASE_IMPORT" -maxdepth 2 -type d -name '*.bak' 2>/dev/null)
+      if (( ${#bak_dirs[@]} )); then
+        rm -rf "${bak_dirs[@]}" && ok "Direktori .bak dihapus" || warn "Gagal menghapus beberapa .bak"
+      else
+        warn "Tidak ada direktori .bak yang ditemukan untuk dihapus."
+      fi
+    fi
+    ok "Full cleanup selesai."
+  else
+    warn "Full cleanup dibatalkan."
+  fi
+  read -r -p "Tekan Enter untuk kembali ke menu..." _
 }
 
 # ---------------------------------------------------------------------
@@ -161,7 +261,11 @@ ensure_dest_ready() {
   require_cmds_export
   [[ -z "$DEST_HOST" ]] && { err "DEST_HOST is not set"; return 1; }
   log "Preparing destination directory on $DEST_HOST:$DEST_DIR (port $DEST_PORT)"
-  ssh -q -p "$DEST_PORT" "root@$DEST_HOST" "bash --noprofile --norc -c 'mkdir -p \"$DEST_DIR\"'" || true
+  # Create destination directory non-interactively.  Using --noprofile/--norc prevents
+  # MOTD/banner output from interfering with commands.  Accept unknown hosts automatically.
+  ssh -q -o StrictHostKeyChecking=accept-new -p "$DEST_PORT" \
+    "root@$DEST_HOST" \
+    "bash --noprofile --norc -c 'mkdir -p \"${DEST_DIR}\"'" || true
 }
 
 # Discover WordPress sites to export. Populates SITES_EXPORT array.
@@ -259,12 +363,18 @@ tar_webroot_export() {
 # to ssh+cat to avoid MOTD/banners if scp fails.
 copy_file_export() {
   local local_file="$1" remote_file="$2"
-  # scp quiet
+  # Create the remote directory if it does not exist. Use non-interactive shell to avoid MOTD.
+  local remote_dir
+  remote_dir="$(dirname "$remote_file")"
+  ssh -q -o StrictHostKeyChecking=accept-new -p "$DEST_PORT" \
+    "root@$DEST_HOST" \
+    "bash --noprofile --norc -c 'mkdir -p \"${remote_dir}\"'" || true
+  # First try scp quietly. If it fails, fall back to ssh+cat which avoids MOTD/banner issues.
   if scp -q -P "$DEST_PORT" "$local_file" "root@$DEST_HOST:$remote_file" >/dev/null 2>&1; then
     return 0
   fi
-  # fallback using ssh+cat
-  if ssh -q -p "$DEST_PORT" "root@$DEST_HOST" "bash --noprofile --norc -c 'cat > \"$remote_file\"'" < "$local_file"; then
+  if ssh -q -p "$DEST_PORT" "root@$DEST_HOST" \
+      "bash --noprofile --norc -c 'cat > \"${remote_file}\"'" < "$local_file"; then
     return 0
   fi
   return 1
@@ -623,20 +733,11 @@ process_site_replace_import() {
   local sqlf="${IMPORT_DIR}/${site}.sql.gz"
   local dst="${WEBROOT_BASE_IMPORT}/${site}"
   log "=== Replace import ${site} ==="
+  # Pastikan direktori target sudah ada (situs harus terpasang terlebih dahulu)
   if [[ ! -d "$dst" ]]; then
     err "Direktori situs belum ada: $dst. Buat terlebih dahulu sebelum replace."
     return 1
   fi
-  # Read original DB credentials from existing wp-config.php
-  local orig_cfg="$dst/wp-config.php"
-  local orig_db_name="" orig_db_user="" orig_db_pass="" orig_db_host=""
-  if [[ -f "$orig_cfg" ]]; then
-    orig_db_name="$(parse_define "$orig_cfg" DB_NAME || true)"
-    orig_db_user="$(parse_define "$orig_cfg" DB_USER || true)"
-    orig_db_pass="$(parse_define "$orig_cfg" DB_PASSWORD || true)"
-    orig_db_host="$(parse_define "$orig_cfg" DB_HOST || true)"
-  fi
-  [[ -z "$orig_db_host" ]] && orig_db_host="localhost"
   # Backup existing webroot
   local backup="${dst}.$(date +%Y%m%d%H%M%S).bak"
   warn "[$site] Direktori ada; backup ke $backup"
@@ -646,32 +747,47 @@ process_site_replace_import() {
   log "[$site] Ekstrak webroot -> $dst"
   tar -C "$WEBROOT_BASE_IMPORT" -xzf "$tarf"
   ok "[$site] Ekstrak webroot selesai"
-  # Update new wp-config.php with original DB credentials
+  # Parse credentials from imported wp-config.php
   local new_cfg="$dst/wp-config.php"
-  if [[ -f "$new_cfg" && -n "$orig_db_name" && -n "$orig_db_user" && -n "$orig_db_pass" ]]; then
-    sed -i "s/define\s*(\'?DB_NAME\'?\s*,\s*'.*');/define( 'DB_NAME', '${orig_db_name}' );/I" "$new_cfg" || true
-    sed -i "s/define\s*(\'?DB_USER\'?\s*,\s*'.*');/define( 'DB_USER', '${orig_db_user}' );/I" "$new_cfg" || true
-    sed -i "s/define\s*(\'?DB_PASSWORD\'?\s*,\s*'.*');/define( 'DB_PASSWORD', '${orig_db_pass}' );/I" "$new_cfg" || true
-    if [[ -n "$orig_db_host" ]]; then
-      sed -i "s/define\s*(\'?DB_HOST\'?\s*,\s*'.*');/define( 'DB_HOST', '${orig_db_host}' );/I" "$new_cfg" || true
-    fi
-    ok "[$site] wp-config.php disesuaikan dengan kredensial DB asli"
-  else
-    warn "[$site] Tidak menemukan kredensial DB asli; wp-config.php tidak diubah"
+  local db_name="" db_user="" db_pass="" db_host=""
+  if [[ -f "$new_cfg" ]]; then
+    db_name="$(parse_define "$new_cfg" DB_NAME || true)"
+    db_user="$(parse_define "$new_cfg" DB_USER || true)"
+    db_pass="$(parse_define "$new_cfg" DB_PASSWORD || true)"
+    db_host="$(parse_define "$new_cfg" DB_HOST || true)"
   fi
-  # Ensure DB exists and import SQL (using root)
-  if [[ -n "$orig_db_name" && -n "$orig_db_user" && -n "$orig_db_pass" ]]; then
-    check_mysql_root
-    ensure_db_and_user "$orig_db_name" "$orig_db_user" "$orig_db_pass"
-    if [[ -f "$sqlf" ]]; then
-      import_sql_gz "$orig_db_name" "$sqlf" || warn "[$site] Gagal impor SQL"
-    else
-      warn "[$site] File SQL tidak ditemukan; lewati impor DB"
+  # If DB_NAME or DB_USER missing, prompt for credentials and update wp-config.php
+  if [[ -z "$db_name" || -z "$db_user" ]]; then
+    warn "[$site] Kredensial DB tidak lengkap di wp-config.php hasil import"
+    read -r -p "Masukkan DB_NAME untuk ${site}: " db_name
+    read -r -p "Masukkan DB_USER untuk ${site}: " db_user
+    read -r -s -p "Masukkan DB_PASSWORD untuk ${site} (biarkan kosong jika tidak ada): " db_pass; echo
+    read -r -p "Masukkan DB_HOST untuk ${site} [localhost]: " db_host_in
+    db_host="${db_host_in:-localhost}"
+    # Tulis ulang definisi ke wp-config.php
+    # Always write DB_NAME and DB_USER; write DB_PASSWORD and DB_HOST even if empty
+    sed -i "s/define\s*(\'?DB_NAME\'?\s*,\s*'.*');/define( 'DB_NAME', '${db_name}' );/I" "$new_cfg" || true
+    sed -i "s/define\s*(\'?DB_USER\'?\s*,\s*'.*');/define( 'DB_USER', '${db_user}' );/I" "$new_cfg" || true
+    # For DB_PASSWORD, handle empty password by writing empty string
+    local pw_repl="define( 'DB_PASSWORD', '${db_pass}' );"
+    sed -i "s/define\s*(\'?DB_PASSWORD\'?\s*,\s*'.*');/${pw_repl}/I" "$new_cfg" || true
+    if [[ -n "$db_host" ]]; then
+      sed -i "s/define\s*(\'?DB_HOST\'?\s*,\s*'.*');/define( 'DB_HOST', '${db_host}' );/I" "$new_cfg" || true
     fi
-  else
-    warn "[$site] Kredensial DB tidak lengkap; lewati impor DB"
+    ok "[$site] wp-config.php diperbarui dengan kredensial baru"
   fi
-  # Fix permissions
+  # Default DB host jika masih kosong
+  [[ -z "$db_host" ]] && db_host="localhost"
+  # Buat database dan user di server baru sesuai kredensial import
+  check_mysql_root
+  ensure_db_and_user "$db_name" "$db_user" "$db_pass"
+  # Import SQL dump jika tersedia
+  if [[ -f "$sqlf" ]]; then
+    import_sql_gz "$db_name" "$sqlf" || warn "[$site] Gagal impor SQL"
+  else
+    warn "[$site] File SQL tidak ditemukan; lewati impor DB"
+  fi
+  # Perbaiki permission
   fix_permissions "$dst"
   log "--- Selesai replace import ${site} ---"
 }
@@ -800,11 +916,13 @@ while true; do
   echo
   echo "============== WORDPRESS MIGRATION MENU =============="
   show_usage
-  read -r -p "Pilih opsi [0-3]: " choice
+  read -r -p "Pilih opsi [0-5]: " choice
   case "$choice" in
     1) menu_export ;;
     2) menu_import ;;
     3) clean_banner ;;
+    4) cleanup_backups ;;
+    5) full_cleanup_all_data ;;
     0) echo "Keluar."; exit 0 ;;
     *) warn "Pilihan tidak dikenal. Coba lagi." ;;
   esac
