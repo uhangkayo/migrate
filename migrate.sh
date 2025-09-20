@@ -203,7 +203,8 @@ dump_db_export() {
   [[ -z "$db_user" ]] && db_user="$(dotenv_get DB_USER "$site_dir" || true)"
   [[ -z "$db_pass" ]] && db_pass="$(dotenv_get DB_PASSWORD "$site_dir" || true)"
   [[ -z "$db_host" ]] && db_host="$(dotenv_get DB_HOST "$site_dir" || true)"
-  if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
+  # Only require DB name and DB user to be present. Allow empty DB password (some setups use no password).
+  if [[ -z "$db_name" || -z "$db_user" ]]; then
     warn "[$site_name] DB credentials not found; skipping dump."
     return 1
   fi
@@ -568,18 +569,19 @@ process_site_import() {
   db_user="$(parse_define "$cfg" DB_USER || true)"
   db_pass="$(parse_define "$cfg" DB_PASSWORD || true)"
   db_host="$(parse_define "$cfg" DB_HOST || true)"
-  if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
+  # Require DB_NAME and DB_USER to be present. Allow empty DB_PASSWORD (can be empty string).
+  if [[ -z "$db_name" || -z "$db_user" ]]; then
     warn "[${site}] Kredensial tidak lengkap di wp-config.php"
     read -r -p "Masukkan DB_NAME untuk ${site}: " db_name
     read -r -p "Masukkan DB_USER untuk ${site}: " db_user
-    read -r -s -p "Masukkan DB_PASSWORD untuk ${site}: " db_pass; echo
+    read -r -s -p "Masukkan DB_PASSWORD untuk ${site} (biarkan kosong jika tidak ada): " db_pass; echo
     db_host="${db_host:-localhost}"
-    # Write credentials back into wp-config.php
-    sed -i "s/define\\s*('\?DB_NAME'\\?,\\s*'.*');/define( 'DB_NAME', '${db_name}' );/I" "$cfg" || true
-    sed -i "s/define\\s*('\?DB_USER'\\?,\\s*'.*');/define( 'DB_USER', '${db_user}' );/I" "$cfg" || true
-    sed -i "s/define\\s*('\?DB_PASSWORD'\\?,\\s*'.*');/define( 'DB_PASSWORD', '${db_pass}' );/I" "$cfg" || true
+    # Write credentials back into wp-config.php. Always write password define even if empty.
+    sed -i "s/define\\s*(\'?DB_NAME'\\?,\\s*'.*');/define( 'DB_NAME', '${db_name}' );/I" "$cfg" || true
+    sed -i "s/define\\s*(\'?DB_USER'\\?,\\s*'.*');/define( 'DB_USER', '${db_user}' );/I" "$cfg" || true
+    sed -i "s/define\\s*(\'?DB_PASSWORD'\\?,\\s*'.*');/define( 'DB_PASSWORD', '${db_pass}' );/I" "$cfg" || true
     if [[ -n "$db_host" ]]; then
-      sed -i "s/define\\s*('\?DB_HOST'\\?,\\s*'.*');/define( 'DB_HOST', '${db_host}' );/I" "$cfg" || true
+      sed -i "s/define\\s*(\'?DB_HOST'\\?,\\s*'.*');/define( 'DB_HOST', '${db_host}' );/I" "$cfg" || true
     fi
     ok "[${site}] wp-config.php updated with new credentials"
   fi
