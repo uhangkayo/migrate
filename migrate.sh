@@ -1,921 +1,809 @@
 #!/usr/bin/env bash
-# migration_menu_v1.sh — Menu-based Pull Migration for WordPress Subdomain
-# TARGET (server baru) menarik data dari SOURCE (server lama)
-# Fitur:
-#  - Menu interaktif: profil, konektivitas, auto-detect webroot & DB, migrasi file, import DB,
-#    tulis Nginx, finalize (ownership & reload).
-#  - Simpan/Load profil di /etc/server_manager/migration.d/<subdomain>.conf
-#  - SSH key atau password (sshpass)
-#  - Anti-banner: sentinel __BEGIN__/__END__ untuk bersihkan output remote
-#  - rsync opsi-kompatibel otomatis; fallback tar stream
-#  - Logging: /var/log/migration_menu_<timestamp>.log
+#
+# wp_migration_menu.sh - Unified WordPress migration menu
+#
+# This script consolidates export and import functionality for migrating
+# WordPress sites between servers. It can be run on either the
+# source (old) server or the destination (new) server. A simple menu
+# allows you to export and transfer WordPress installations from the
+# old server to the new server, import those packages, set up the
+# database and nginx configuration, fix filesystem permissions, and
+# optionally clean login banners (MOTD) that interfere with scp/ssh.
+#
+# Usage:
+#   1. Copy this script to both old and new servers.
+#   2. Run it as root. Select the export option on the old server
+#      and follow the prompts to send packages to the new server.
+#   3. On the new server, select the import option to extract,
+#      create the database, and configure nginx.
+#
+# The script logs all actions with timestamps. It retries operations
+# such as dumping the database and transferring files to improve
+# robustness. Defaults may be overridden via environment variables
+# (DEST_HOST, DEST_PORT, DEST_DIR, EXPORT_DIR, IMPORT_DIR, etc.).
 
-set -euo pipefail
-IFS=$'\n\t'
+set -Eeuo pipefail
 
-# ====== Global ======
-TS="$(date +%Y%m%d-%H%M%S)"
-LOG_FILE="/var/log/migration_menu_${TS}.log"
-PROFILE_DIR="/etc/server_manager/migration.d"
-mkdir -p "$PROFILE_DIR" >/dev/null 2>&1 || true
+# ---------------------------------------------------------------------
+# Basic utility functions
+# ---------------------------------------------------------------------
 
-# runtime vars (diisi via menu/atau load profil)
-SUBDOMAIN=""
-SRC_HOST=""
-SRC_USER="root"
-SRC_PORT="22"
-SSHPASS=""
+ts() { date '+%F %T'; }
+log() { printf '[%s] %s\n' "$(ts)" "$*"; }
+ok() { log "OK: $*"; }
+warn() { log "WARN: $*"; }
+err() { log "ERROR: $*"; }
 
-SRC_WEBROOT=""               # auto detect jika kosong
-DST_WEBROOT=""               # default: /var/www/<subdomain>
+# Catch any unhandled error and print a message
+trap 'err "Unexpected error at line $LINENO"' ERR
 
-WANT_DB="auto"               # auto/yes/no
-DB_NAME=""
-DB_USER=""
-DB_PASS=""
-T_DB=""
-T_USER=""
-T_PASS=""
-
-NO_NGINX="0"                 # 1=skip tulis nginx
-DRY_RUN="0"                  # 1=rsync dry-run
-FORCE_RSYNC="1"              # 1=rsync, 0=tar
-
-SSH_LAST_STATUS=0
-SSH_LAST_ERROR=""
-SSHPASS_WARNED="0"
-SSHPASS_FALLBACK="0"
-SSH_BASE_CMD=""
-
-# ====== Helpers ======
-log()   { printf "[%s] %s\n" "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
-warn()  { printf "\033[33mWARN:\033[0m %s\n" "$*" | tee -a "$LOG_FILE"; }
-err()   { printf "\033[31mERROR:\033[0m %s\n" "$*" | tee -a "$LOG_FILE"; }
-need()  { command -v "$1" >/dev/null 2>&1 || { err "Missing '$1'"; return 1; } }
-bytes_to_h(){ awk -v b="${1:-0}" 'function H(x){s[0]="B";s[1]="K";s[2]="M";s[3]="G";s[4]="T";i=0;while(x>=1024&&i<4){x/=1024;i++}return sprintf("%.2f%s",x,s[i])}BEGIN{print H(b)}'; }
-sanitize(){ echo "$1" | tr -cd '[:alnum:]_.-'; }
-pause(){ read -r -p "Press Enter untuk lanjut... " _ || true; }
-
-phpfpm_sock_guess(){
-  for v in 8.4 8.3 8.2 8.1 8.0 7.4; do s="/run/php/php${v}-fpm.sock"; [[ -S "$s" ]] && { echo "$s"; return; }; done
-  [[ -S /run/php/php-fpm.sock ]] && { echo /run/php/php-fpm.sock; return; }
-  [[ -S /var/run/php/php-fpm.sock ]] && { echo /var/run/php/php-fpm.sock; return; }
-  echo /run/php/php-fpm.sock
+# Print the main menu usage
+show_usage() {
+  cat <<'USAGE'
+Menu:
+  1) Export WordPress sites (run on old server)
+  2) Import WordPress sites (run on new server)
+  3) Clean login banner/MOTD on this machine
+  0) Exit
+USAGE
 }
 
-notify(){ command -v notify-send >/dev/null 2>&1 && notify-send "Migration Menu" "$*" || true; log "$*"; }
+# Escape single quotes in a string so it can be safely embedded in
+# single‑quoted shell strings. Replaces ' with '\'' sequence.
+escape_squote() {
+  local s="${1:-}"
+  printf '%s' "${s//\'/\'"\'"\'}"
+}
 
-# ====== SSH wrappers (sentinel) ======
-build_ssh_base(){
-  SSHPASS_FALLBACK="0"
-  SSH_BASE_CMD=""
-  if [[ -n "$SSHPASS" ]]; then
+# Split a host:port string into host and port components. Defaults
+# port to 3306 if not specified.
+split_host_port() {
+  local raw="$1" host="$1" port="3306"
+  if [[ "$raw" == *:* ]]; then
+    host="${raw%%:*}"; port="${raw##*:}"
+  fi
+  printf '%s %s' "$host" "$port"
+}
 
-    printf "sshpass -p '%s' ssh -T -q -p %s -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
-      "$(printf "%s" "$SSHPASS")" "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
+# ---------------------------------------------------------------------
+# Login banner / MOTD cleaning
+# ---------------------------------------------------------------------
+
+# Disable pam_motd and pam_lastlog to prevent login banners from
+# interfering with non‑interactive scp/ssh. Also disables update-motd.d
+# scripts, sets PrintMotd to no, and ensures root .bashrc is quiet.
+clean_banner() {
+  log "Disabling login banners and MOTD on this machine..."
+  local pam_file="/etc/pam.d/sshd"
+  if [[ -f "$pam_file" ]]; then
+    cp "$pam_file" "${pam_file}.bak.$(date +%s)" || true
+    # Comment out pam_motd and pam_lastlog lines completely
+    sed -i -E 's/^session[[:space:]]+optional[[:space:]]+pam_motd\\.so.*/# &/' "$pam_file" || true
+    sed -i -E 's/^session[[:space:]]+optional[[:space:]]+pam_lastlog\\.so.*/# &/' "$pam_file" || true
+  fi
+  chmod -x /etc/update-motd.d/* 2>/dev/null || true
+  # Disable PrintMotd
+  if ! grep -q '^PrintMotd' /etc/ssh/sshd_config; then
+    echo 'PrintMotd no' >> /etc/ssh/sshd_config
   else
-    printf "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
-      "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
+    sed -i 's/^PrintMotd.*/PrintMotd no/' /etc/ssh/sshd_config
   fi
-  printf -v SSH_BASE_CMD "ssh -T -q -p %s -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o SetEnv=TERM=dumb %s@%s" \
-    "$SRC_PORT" "$SRC_USER" "$SRC_HOST"
-  return 0
-}
-
-remote_marked(){
-  local cmd="$1"
-  build_ssh_base
-  local ssh_cmd="$SSH_BASE_CMD"
-  # shellcheck disable=SC2016
-  eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; ( $cmd ) 2>/dev/null; printf __END__' " \
-    2> >(grep -v 'TERM environment variable not set' >&2) \
-    | sed -n '/__BEGIN__/,/__END__/p' | sed -e '1d' -e '$d'
-}
-
-ssh_check(){
-
-  local ssh_cmd; ssh_cmd="$(build_ssh_base)"
-  eval "TERM=dumb $ssh_cmd 'printf __BEGIN__; echo ok; printf __END__' " \
-    2> >(grep -v 'TERM environment variable not set' >&2) \
-    | sed -n 's/^.*__BEGIN__\(.*\)__END__.*$/\1/p' | grep -q '^ok$'
-}
-
-# ====== rsync/tar ======
-rsync_opts_build(){
-  local base="-a --delete --partial"
-  local extra=""
-  rsync --version >/dev/null 2>&1 || { echo "$base"; return; }
-  if rsync --help | grep -q 'info=progress2'; then extra="$extra --info=progress2"; else extra="$extra --progress"; fi
-  if rsync --help | grep -q 'append-verify'; then extra="$extra --append-verify"; else extra="$extra --append"; fi
-  echo "$base $extra"
-}
-
-rsync_pull(){
-  local src="$1" dst="$2"
-  local opts; opts="$(rsync_opts_build)"
-  build_ssh_base
-  local ssh_tun="$SSH_BASE_CMD"
-  mkdir -p "$dst"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    # shellcheck disable=SC2086
-    rsync -n ${opts} -e "$ssh_tun" "$src/" "$dst/"
+  # Silence .bashrc for non‑interactive sessions
+  if ! grep -q 'case \$- in \*i\*\)' /root/.bashrc 2>/dev/null; then
+    sed -i '1i case $- in *i*) ;; *) return;; esac' /root/.bashrc
   fi
-  # shellcheck disable=SC2086
-  rsync ${opts} -e "$ssh_tun" "$src/" "$dst/"
+  systemctl reload sshd 2>/dev/null || systemctl reload ssh || true
+  ok "Login banners/MOTD disabled."
 }
 
-tar_pull(){
-  local src_dir="$1" dst_dir="$2"
-  build_ssh_base
-  local ssh_cmd="$SSH_BASE_CMD"
-  mkdir -p "$dst_dir"
-  if command -v pigz >/dev/null 2>&1; then
-    eval "$ssh_cmd 'tar -C \"$(dirname "$src_dir")\" -cpf - \"$(basename "$src_dir")\" | pigz -1'" | pigz -d | tar -C "$dst_dir/.." -xpf -
+# ---------------------------------------------------------------------
+# Export functions (run on old server)
+# ---------------------------------------------------------------------
+
+# Configurable defaults for export
+DEST_HOST="${DEST_HOST:-}"
+DEST_PORT="${DEST_PORT:-22}"
+DEST_DIR="${DEST_DIR:-/root/wp_imports}"
+EXPORT_DIR="${EXPORT_DIR:-/root/wp_exports}"
+WEBROOT_BASE_EXPORT="${WEBROOT_BASE_EXPORT:-/var/www}"
+ONLY_EXPORT="${ONLY_EXPORT:-}"
+RETRY_EXPORT="${RETRY_EXPORT:-2}"
+
+# Verify that required commands exist on the export side
+require_cmds_export() {
+  local cmds=(find awk sed tar gzip mysqldump scp ssh)
+  local missing=()
+  for c in "${cmds[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if ((${#missing[@]})); then
+    err "Missing commands: ${missing[*]}"
+    echo "Install them and try again." >&2
+    exit 1
+  fi
+}
+
+# Extract a constant from wp-config.php (define('KEY', 'value');)
+parse_define() {
+  local file="$1" key="$2"
+  awk -v k="$key" '
+    BEGIN{IGNORECASE=1}
+    $0 ~ /define[[:space:]]*\(/ && $0 ~ k {
+      line=$0
+      while (line !~ /\);$/ && getline nxt) line=line "\n" nxt
+      print line
+    }
+  ' "$file" 2>/dev/null | \
+    sed -nE "s/.*define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"][[:space:]]*\).*/\1/p" | \
+    head -n1
+}
+
+# Fallback to WP-CLI for reading config values if parse_define fails
+wp_get() {
+  local key="$1" path="$2"
+  if command -v wp >/dev/null 2>&1; then
+    wp config get "$key" --path="$path" --allow-root 2>/dev/null || true
   else
-    eval "$ssh_cmd 'tar -C \"$(dirname "$src_dir")\" -cpf - \"$(basename "$src_dir")\" | gzip -1'" | gzip -d | tar -C "$dst_dir/.." -xpf -
+    php -r "copy('https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar','/tmp/wp-cli.phar');" 2>/dev/null || return 1
+    php /tmp/wp-cli.phar config get "$key" --path="$path" --allow-root 2>/dev/null || true
   fi
 }
 
-# ====== Profile ======
-profile_path(){ echo "$PROFILE_DIR/${SUBDOMAIN}.conf"; }
-
-save_profile(){
-  [[ -n "$SUBDOMAIN" ]] || { err "SUBDOMAIN kosong"; return 1; }
-  cat > "$(profile_path)" <<EOF
-SUBDOMAIN="$SUBDOMAIN"
-SRC_HOST="$SRC_HOST"
-SRC_USER="$SRC_USER"
-SRC_PORT="$SRC_PORT"
-SSHPASS="$SSHPASS"
-SRC_WEBROOT="$SRC_WEBROOT"
-DST_WEBROOT="$DST_WEBROOT"
-WANT_DB="$WANT_DB"
-DB_NAME="$DB_NAME"
-DB_USER="$DB_USER"
-DB_PASS="$DB_PASS"
-T_DB="$T_DB"
-T_USER="$T_USER"
-T_PASS="$T_PASS"
-NO_NGINX="$NO_NGINX"
-DRY_RUN="$DRY_RUN"
-FORCE_RSYNC="$FORCE_RSYNC"
-EOF
-  notify "Profil disimpan: $(profile_path)"
+# Fallback to .env file
+dotenv_get() {
+  local key="$1" envfile="$2/.env"
+  [[ -f "$envfile" ]] || return 1
+  sed -nE "s/^\s*${key}\s*=\s*\"?([^\"]+)\"?\s*$/\1/p" "$envfile" | head -n1
 }
 
-load_profile(){
-  local p="$1"
-  [[ -f "$PROFILE_DIR/$p" ]] || { err "Profil tidak ditemukan"; return 1; }
-  # shellcheck disable=SC1090
-  . "$PROFILE_DIR/$p"
-  SUBDOMAIN="${SUBDOMAIN:-}"
-  DST_WEBROOT="${DST_WEBROOT:-/var/www/${SUBDOMAIN}}"
-  notify "Profil dimuat: $p"
+# Prepare the remote directory on the destination host
+ensure_dest_ready() {
+  require_cmds_export
+  [[ -z "$DEST_HOST" ]] && { err "DEST_HOST is not set"; return 1; }
+  log "Preparing destination directory on $DEST_HOST:$DEST_DIR (port $DEST_PORT)"
+  ssh -q -p "$DEST_PORT" "root@$DEST_HOST" "bash --noprofile --norc -c 'mkdir -p \"$DEST_DIR\"'" || true
 }
 
-list_profiles(){
-  ls -1 "$PROFILE_DIR" 2>/dev/null | sed 's/\.conf$//' || true
-}
-
-remote_subdomains_fetch(){
-  local cmd
-  cmd=$(cat <<'CMD'
-(
-  for path in /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/sites-available; do
-    if [ -d "$path" ]; then
-      grep -RhoE "server_name[[:space:]]+[^;#]*" "$path" 2>/dev/null
-    fi
+# Discover WordPress sites to export. Populates SITES_EXPORT array.
+list_sites_export() {
+  SITES_EXPORT=()
+  mapfile -t config_paths < <(find "$WEBROOT_BASE_EXPORT" -type f -name 'wp-config.php' 2>/dev/null | sort)
+  for cfg in "${config_paths[@]}"; do
+    local dir; dir="$(dirname "$cfg")"
+    SITES_EXPORT+=("$dir")
   done
-) | awk "{for (i=2; i<=NF; i++) {gsub(/;$/,"", $i); if (length($i) > 0 && index($i, ".") > 0) print $i;}}" | sort -u
-CMD
-  )
-  remote_marked "$cmd" | tr -d '\r' | sed '/^[[:space:]]*$/d'
+  if [[ -n "$ONLY_EXPORT" ]]; then
+    local filtered=()
+    IFS=',' read -ra want <<<"$ONLY_EXPORT"
+    for path in "${SITES_EXPORT[@]}"; do
+      local base; base="$(basename "$path")"
+      for w in "${want[@]}"; do
+        [[ "$base" == "$w" ]] && filtered+=("$path")
+      done
+    done
+    SITES_EXPORT=("${filtered[@]}")
+  fi
 }
 
-remote_subdomain_menu(){
-  log "Mengambil daftar subdomain (server_name) dari SOURCE..."
-  local raw; raw="$(remote_subdomains_fetch || true)"
-  raw="$(printf '%s\n' "$raw" | sed '/^[[:space:]]*$/d')"
-  if [[ -z "$raw" ]]; then
-    warn "Tidak menemukan daftar subdomain dari konfigurasi Nginx SOURCE."
-    return
+# Dump database for a site. Uses credentials from wp-config.php or
+# fallback sources. Writes to $EXPORT_DIR/<site>.sql.gz
+dump_db_export() {
+  local site_dir="$1" site_name="$2"
+  local cfg="$site_dir/wp-config.php"
+  local db_name db_user db_pass db_host
+  db_name="$(parse_define "$cfg" DB_NAME || true)"
+  db_user="$(parse_define "$cfg" DB_USER || true)"
+  db_pass="$(parse_define "$cfg" DB_PASSWORD || true)"
+  db_host="$(parse_define "$cfg" DB_HOST || true)"
+  [[ -z "$db_name" ]] && db_name="$(wp_get DB_NAME "$site_dir" || true)"
+  [[ -z "$db_user" ]] && db_user="$(wp_get DB_USER "$site_dir" || true)"
+  [[ -z "$db_pass" ]] && db_pass="$(wp_get DB_PASSWORD "$site_dir" || true)"
+  [[ -z "$db_host" ]] && db_host="$(wp_get DB_HOST "$site_dir" || true)"
+  [[ -z "$db_name" ]] && db_name="$(dotenv_get DB_NAME "$site_dir" || true)"
+  [[ -z "$db_user" ]] && db_user="$(dotenv_get DB_USER "$site_dir" || true)"
+  [[ -z "$db_pass" ]] && db_pass="$(dotenv_get DB_PASSWORD "$site_dir" || true)"
+  [[ -z "$db_host" ]] && db_host="$(dotenv_get DB_HOST "$site_dir" || true)"
+  if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
+    warn "[$site_name] DB credentials not found; skipping dump."
+    return 1
   fi
-
-  local -a subdomain_list=()
-  mapfile -t subdomain_list <<<"$raw"
-  if [[ ${#subdomain_list[@]} -eq 0 ]]; then
-    warn "Daftar subdomain kosong."
-    return
-  fi
-
-  echo "==================== DAFTAR SUBDOMAIN SOURCE ===================="
-  local idx
-  for idx in "${!subdomain_list[@]}"; do
-    printf " %2d) %s\n" "$((idx + 1))" "${subdomain_list[$idx]}"
-  done
-  echo "-----------------------------------------------------------------"
-  local selection
-  read -r -p "Pilih nomor untuk set SUBDOMAIN atau ketik manual (Enter=skip): " selection || true
-
-  if [[ "$selection" =~ ^[0-9]+$ ]]; then
-    local index=$((selection - 1))
-    if (( index >= 0 && index < ${#subdomain_list[@]} )); then
-      local chosen="${subdomain_list[$index]}"
-      chosen="$(sanitize "$chosen")"
-      if [[ -n "$chosen" ]]; then
-        SUBDOMAIN="$chosen"
-        DST_WEBROOT="/var/www/${SUBDOMAIN}"
-        SRC_WEBROOT=""
-        notify "SUBDOMAIN di-set ke $SUBDOMAIN (DST webroot direset ke default)."
-        save_profile
+  [[ -z "$db_host" ]] && db_host="localhost"
+  read -r host port <<<"$(split_host_port "$db_host")"
+  local out="$EXPORT_DIR/${site_name}.sql.gz"
+  log "[$site_name] Dumping DB ($db_name@$host:$port) -> $out"
+  local pw_esc; pw_esc="$(escape_squote "$db_pass")"
+  local attempt=0
+  while (( attempt <= RETRY_EXPORT )); do
+    if [[ "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+      if eval "mysqldump --single-transaction --quick --hex-blob --default-character-set=utf8mb4 -u'$db_user' --password='$pw_esc' '$db_name' | gzip -c > '$out'"; then
+        ok "[$site_name] Database dump completed"
+        return 0
       fi
     else
-      warn "Nomor di luar jangkauan daftar subdomain."
+      if eval "mysqldump --single-transaction --quick --hex-blob --default-character-set=utf8mb4 -h '$host' -P '$port' -u'$db_user' --password='$pw_esc' '$db_name' | gzip -c > '$out'"; then
+        ok "[$site_name] Database dump completed"
+        return 0
+      fi
     fi
-    return
-  fi
-
-  if [[ -n "$selection" ]]; then
-    local manual
-    manual="$(sanitize "$selection")"
-    if [[ -n "$manual" ]]; then
-      SUBDOMAIN="$manual"
-      DST_WEBROOT="/var/www/${SUBDOMAIN}"
-      SRC_WEBROOT=""
-      notify "SUBDOMAIN di-set ke $SUBDOMAIN (input manual)."
-      save_profile
-    else
-      warn "Input manual kosong setelah disanitasi."
-    fi
-  fi
-}
-
-
-
-
-# ====== Steps ======
-deps_menu(){
-  local mode="${1:-}" auto=0
-
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  echo "Memeriksa dependencies..."
-  local missing=0
-  for bin in ssh rsync mysql mysqldump awk sed tar gzip; do
-    if ! need "$bin"; then missing=1; fi
+    # increment attempt counter safely
+    attempt=$((attempt+1))
+    warn "[$site_name] DB dump failed (attempt $attempt), retrying..."
+    sleep 2
   done
-  if [[ -n "$SSHPASS" ]]; then
-    if ! need sshpass; then
-      warn "sshpass belum terpasang padahal SSHPASS digunakan. Install: apt-get install -y sshpass"
-      missing=1
-    fi
-  fi
-  if [[ "$missing" == "0" ]]; then
-    notify "✅ Dependencies OK"
-  else
-    warn "Ada dependency yang belum lengkap."
-  fi
-
-
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return $missing
+  err "[$site_name] Failed to dump DB after $RETRY_EXPORT retries"
+  return 1
 }
 
-source_connection_menu(){
-  echo "Set Source Connection (Quick). Isikan untuk menyiapkan koneksi dasar sebelum menjalankan ONE-CLICK."
-  local input usepass default_usepass test_now
-
-  read -r -p "Sub-domain (mis: blog.domain.com) [${SUBDOMAIN:-}]: " input
-  if [[ -n "$input" ]]; then
-    local sanitized; sanitized="$(sanitize "$input")"
-    if [[ -n "$sanitized" ]]; then
-      SUBDOMAIN="$sanitized"
-      DST_WEBROOT="/var/www/${SUBDOMAIN}"
-      SRC_WEBROOT=""
-      notify "SUBDOMAIN di-set ke $SUBDOMAIN"
-    else
-      warn "Input subdomain kosong setelah disanitasi."
-    fi
-  fi
-
-  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
-  if [[ -n "$input" ]]; then
-    SRC_HOST="$input"
-  fi
-
-  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
-  SRC_USER="${input:-${SRC_USER:-root}}"
-
-  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
-  SRC_PORT="${input:-${SRC_PORT:-22}}"
-
-  default_usepass="N"
-  [[ -n "$SSHPASS" ]] && default_usepass="Y"
-  read -r -p "Gunakan password/sshpass? (y/N) [$default_usepass]: " usepass
-  usepass="${usepass:-$default_usepass}"
-
-  if [[ "$usepass" =~ ^[Yy]$ ]]; then
-    if need sshpass; then
-      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
-    else
-      warn "sshpass belum ada; install dulu di menu Dependencies."
-      SSHPASS=""
-    fi
-  else
-    SSHPASS=""
-  fi
-
-  if [[ -z "$SRC_HOST" ]]; then
-    warn "SRC_HOST masih kosong. Lengkapi sebelum melanjutkan."
-  fi
-
-  if [[ -n "$SUBDOMAIN" ]]; then
-    save_profile
-  else
-    warn "SUBDOMAIN masih kosong; isi agar profil dapat disimpan."
-  fi
-
-  read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
-  test_now="${test_now:-Y}"
-  if [[ "$test_now" =~ ^[Yy]$ ]]; then
-
-    test_connect_menu
-  else
-    pause
-  fi
-}
-
-source_connection_menu(){
-  echo "Konfigurasi koneksi SOURCE (server lama). Kosongkan untuk mempertahankan nilai saat ini."
-  local input usepass default_usepass test_now
-
-  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
-  if [[ -n "$input" ]]; then
-    SRC_HOST="$input"
-  fi
-
-  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
-  SRC_USER="${input:-${SRC_USER:-root}}"
-
-  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
-  SRC_PORT="${input:-${SRC_PORT:-22}}"
-
-  default_usepass="N"
-  [[ -n "$SSHPASS" ]] && default_usepass="Y"
-  read -r -p "Gunakan password/sshpass? (y/N) [$default_usepass]: " usepass
-  usepass="${usepass:-$default_usepass}"
-
-  if [[ "$usepass" =~ ^[Yy]$ ]]; then
-    if need sshpass; then
-      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
-    else
-      warn "sshpass belum ada; install dulu di menu Dependencies."
-      SSHPASS=""
-    fi
-  else
-    SSHPASS=""
-  fi
-
-  if [[ -z "$SRC_HOST" ]]; then
-    warn "SRC_HOST masih kosong. Lengkapi sebelum melanjutkan."
-  fi
-
-  [[ -n "$SUBDOMAIN" ]] && save_profile
-
-  read -r -p "Tes koneksi sekarang? (Y/n) [Y]: " test_now
-  test_now="${test_now:-Y}"
-  if [[ "$test_now" =~ ^[Yy]$ ]]; then
-    test_connect_menu
-  else
-
-    pause
-  fi
-}
-
-new_profile_menu(){
-  local input usepass default_usepass
-  read -r -p "Sub-domain (mis: blog.domain.com): " SUBDOMAIN
-  SUBDOMAIN="$(sanitize "$SUBDOMAIN")"
-
-  read -r -p "IP/Host server LAMA (SOURCE) [${SRC_HOST:-}]: " input
-  if [[ -n "$input" ]]; then
-    SRC_HOST="$input"
-  fi
-
-  read -r -p "User SSH SOURCE [${SRC_USER:-root}]: " input
-  SRC_USER="${input:-${SRC_USER:-root}}"
-
-  read -r -p "Port SSH SOURCE [${SRC_PORT:-22}]: " input
-  SRC_PORT="${input:-${SRC_PORT:-22}}"
-
-  default_usepass="N"
-  [[ -n "$SSHPASS" ]] && default_usepass="Y"
-  read -r -p "Pakai password (y/N)? Jika y, akan diminta password setelah tes koneksi [$default_usepass]: " usepass
-  usepass="${usepass:-$default_usepass}"
-
-  DST_WEBROOT="/var/www/${SUBDOMAIN}"
-  SRC_WEBROOT=""   # biarkan auto
-  WANT_DB="auto"   # auto detect
-
-  if [[ "$usepass" =~ ^[Yy]$ ]]; then
-    if need sshpass; then
-      read -r -s -p "Password SSH SOURCE ($SRC_USER@$SRC_HOST): " SSHPASS; echo
-    else
-      warn "sshpass belum ada; install dulu di menu Dependencies."
-      SSHPASS=""
-    fi
-  else
-    SSHPASS=""
-  fi
-
-  save_profile
-  pause
-}
-
-load_profile_menu(){
-  echo "Profil tersedia:"
-  list_profiles
-  read -r -p "Ketik nama profil (tanpa .conf): " name
-  load_profile "${name}.conf" || true
-  pause
-}
-
-test_connect_menu(){
-
-
-  local skip_pause="${1:-0}"
-  if [[ -z "$SRC_HOST" ]]; then
-    err "Profil belum lengkap (SRC_HOST kosong)"
-    [[ "$skip_pause" == "1" ]] || pause
-    return
-
-  fi
-
-  SRC_USER="${SRC_USER:-root}"
-  SRC_PORT="${SRC_PORT:-22}"
-
-  log "Tes koneksi SSH ke $SRC_USER@$SRC_HOST:$SRC_PORT ..."
-  if ssh_check; then
-    notify "✅ SSH non-interaktif OK"
-
-    remote_subdomain_menu
-
-  else
-    if [[ "$SSHPASS_FALLBACK" == "1" ]]; then
-      if [[ "$SSHPASS_WARNED" != "1" ]]; then
-        err "SSHPASS diisi tetapi utilitas 'sshpass' belum terpasang. Install sshpass atau kosongkan password untuk memakai SSH key."
-        SSHPASS_WARNED="1"
-      fi
-    elif [[ -n "$SSHPASS" ]]; then
-      case "$SSH_LAST_STATUS" in
-        5|6)
-          warn "Autentikasi password gagal (kode $SSH_LAST_STATUS). Pastikan password benar dan root login diizinkan."
-          ;;
-        255)
-          warn "Tidak bisa membuka koneksi ke $SRC_HOST:$SRC_PORT. Periksa firewall, IP, atau konfirmasi fingerprint host (misal server Lempzy)."
-          ;;
-        *)
-          warn "SSH pass mungkin salah atau root login ditolak oleh SOURCE (exit $SSH_LAST_STATUS)."
-          ;;
-      esac
-    else
-      case "$SSH_LAST_STATUS" in
-        255)
-          warn "Tidak bisa membuka koneksi ke $SRC_HOST:$SRC_PORT. Firewall, IP salah, atau butuh approve fingerprint manual."
-          ;;
-        *)
-          warn "SSH key tidak bekerja. Opsi: jalankan 'ssh-copy-id -p $SRC_PORT $SRC_USER@$SRC_HOST' atau set SSHPASS + install sshpass."
-          ;;
-      esac
-    fi
-    if [[ -n "$SSH_LAST_ERROR" ]]; then
-      warn "Detail SSH: $SSH_LAST_ERROR"
-    fi
-
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 1
-  fi
-
-
-
-  if [[ "$skip_pause" != "1" ]]; then
-    pause
-  fi
-
-}
-
-detect_webroot_menu(){
-  local mode="${1:-}" auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  if [[ -z "$SUBDOMAIN" || -z "$SRC_HOST" ]]; then
-    err "Profil belum lengkap"
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 1
-  fi
-
-  if [[ -z "$SRC_WEBROOT" ]]; then
-    log "Deteksi webroot via Nginx SOURCE..."
-    local conf; conf="$(remote_marked "grep -RIl \"server_name[[:space:]]\\+${SUBDOMAIN}[;]\" /etc/nginx/sites-enabled 2>/dev/null | head -n1" | head -n1 || true)"
-    if [[ -n "$conf" ]]; then
-      SRC_WEBROOT="$(remote_marked "awk '/^[[:space:]]*root[[:space:]]/ && \$0 !~ /#/{print \$2}' \"$conf\" | sed 's/;//' | head -n1" | tr -d '\r' | head -n1 || true)"
-    fi
-    [[ -z "$SRC_WEBROOT" ]] && SRC_WEBROOT="/var/www/${SUBDOMAIN}"
-    log "SOURCE webroot: $SRC_WEBROOT"
-    save_profile
-  else
-    log "SOURCE webroot sudah di-set: $SRC_WEBROOT"
-  fi
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return 0
-}
-
-detect_db_menu(){
-
-  local mode="${1:-}" auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  if [[ -z "$SRC_WEBROOT" ]]; then
-    err "Set/deteksi webroot dulu"
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 1
-  fi
-  if [[ "$WANT_DB" == "no" ]]; then
-    warn "DB diset tidak akan dipindah (NO_DB)."
-
-
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 0
-  fi
-
-  log "Cari wp-config.php di SOURCE..."
-  local WPC; WPC="$(remote_marked "find \"$SRC_WEBROOT\" -maxdepth 3 -type f -name wp-config.php 2>/dev/null | head -n1" | tr -d '\r' || true)"
-  if [[ -z "$WPC" ]]; then
-    local parent; parent="$(remote_marked "dirname \"$SRC_WEBROOT\"" | tr -d '\r' || true)"
-    WPC="$(remote_marked "find \"$parent\" -maxdepth 2 -type f -name wp-config.php 2>/dev/null | head -n1" | tr -d '\r' || true)"
-  fi
-
-  if [[ -n "$WPC" ]]; then
-    log "wp-config.php: $WPC"
-    local hasphp; hasphp="$(remote_marked "command -v php >/dev/null && echo yes || echo no" | tr -d '\r')"
-    local out
-    if [[ "$hasphp" == "yes" ]]; then
-      out="$(remote_marked "php -r '\
-        \$c=@file_get_contents(\"$WPC\");\
-        function g(\$k,\$c){ if(preg_match(\"/define\\(\\s*\\'\".\$k.\"\\'\\s*,\\s*\\'([^\\']*)\\'\\s*\\)/\", \$c, \$m)){echo \$m[1].\"\\n\";} else {echo \"\\n\";} }\
-        g(\"DB_NAME\", \$c); g(\"DB_USER\", \$c); g(\"DB_PASSWORD\", \$c);\
-      '")"
-    else
-      out="$(remote_marked "echo \"\$(grep -E \"define\\(\\s*'DB_NAME'\" \"$WPC\" | sed -E \"s/.*'DB_NAME'\\s*,\\s*'([^']*)'.*/\\1/\")\"; \
-                             echo \"\$(grep -E \"define\\(\\s*'DB_USER'\" \"$WPC\" | sed -E \"s/.*'DB_USER'\\s*,\\s*'([^']*)'.*/\\1/\")\"; \
-                             echo \"\$(grep -E \"define\\(\\s*'DB_PASSWORD'\" \"$WPC\" | sed -E \"s/.*'DB_PASSWORD'\\s*,\\s*'([^']*)'.*/\\1/\")\"")"
-    fi
-    DB_NAME="$(printf '%s\n' "$out" | sed -n '1p')"; DB_USER="$(printf '%s\n' "$out" | sed -n '2p')"; DB_PASS="$(printf '%s\n' "$out" | sed -n '3p')"
-    DB_NAME="$(sanitize "${DB_NAME:-}")"; DB_USER="$(sanitize "${DB_USER:-}")"
-    if [[ -n "${DB_NAME:-}" ]]; then
-      notify "Deteksi DB: name=$DB_NAME user=$DB_USER (password: $( [[ -n "${DB_PASS:-}" ]] && echo ada || echo kosong ))"
-      WANT_DB="yes"
-      # set default target creds (bisa diubah manual via edit profil)
-      T_DB="${T_DB:-$DB_NAME}"
-      T_USER="${T_USER:-${DB_USER:-${SUBDOMAIN//./_}}}"
-      [[ -z "${T_PASS:-}" ]] && T_PASS="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)"
-      save_profile
-    else
-      warn "Tidak bisa ekstrak DB dari wp-config.php; set WANT_DB=no jika ingin skip."
-      WANT_DB="no"
-      save_profile
-    fi
-  else
-    warn "wp-config.php tidak ditemukan; set WANT_DB=no jika hanya copy file."
-    WANT_DB="no"
-    save_profile
-  fi
-
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return 0
-}
-
-migrate_files_menu(){
-
-
-
-  local mode="${1:-}" auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  if [[ -z "$SUBDOMAIN" || -z "$SRC_WEBROOT" ]]; then
-    err "Profil belum lengkap (subdomain/webroot)"
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 1
-  fi
-  DST_WEBROOT="${DST_WEBROOT:-/var/www/${SUBDOMAIN}}"
-  mkdir -p "$DST_WEBROOT"
-
-  local est; est="$(remote_marked "du -sb \"$SRC_WEBROOT\" 2>/dev/null | awk '{print \$1}'" | tr -d '\r' || true)"
-  [[ -z "${est:-}" ]] && est=0
-  log "Perkiraan size SOURCE: $(bytes_to_h "$est")"
-
-
-
-  if [[ $auto -eq 1 ]]; then
-    FORCE_RSYNC="1"
-    DRY_RUN="0"
-  else
-    read -r -p "Pakai rsync (Y) atau tar fallback (t)? [Y/t]: " choice; choice="${choice:-Y}"
-    if [[ "$choice" =~ ^[Tt]$ ]]; then FORCE_RSYNC="0"; else FORCE_RSYNC="1"; fi
-    read -r -p "Dry-run dulu untuk rsync? (y/N): " dry; dry="${dry:-N}"; [[ "$dry" =~ ^[Yy]$ ]] && DRY_RUN="1" || DRY_RUN="0"
-  fi
-  save_profile
-
-  notify "Mulai tarik FILES..."
-  local status=0
-  if [[ "$FORCE_RSYNC" == "1" ]]; then
-    if ! rsync_pull "${SRC_USER}@${SRC_HOST}:${SRC_WEBROOT}" "${DST_WEBROOT}"; then
-      warn "rsync gagal, fallback ke tar stream"
-      if ! tar_pull "${SRC_WEBROOT}" "${DST_WEBROOT}"; then
-        err "Tar fallback gagal"
-        status=1
-      fi
-    fi
-  else
-    if ! tar_pull "${SRC_WEBROOT}" "${DST_WEBROOT}"; then
-      err "Tar fallback gagal"
-      status=1
-    fi
-  fi
-  if [[ $status -eq 0 ]]; then
-    notify "FILES selesai."
-  fi
-
-
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return $status
-}
-
-import_db_menu(){
-
-
-
-  local mode="${1:-}" auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  if [[ "$WANT_DB" != "yes" || -z "${DB_NAME:-}" ]]; then
-    warn "Import DB dilewati (tidak terdeteksi atau dinonaktifkan)."
-    if [[ $auto -ne 1 ]]; then pause; fi
-    return 0
-  fi
-
-  T_DB="${T_DB:-$DB_NAME}"
-  T_USER="${T_USER:-${DB_USER:-${SUBDOMAIN//./_}}}"
-  T_PASS="${T_PASS:-$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)}"
-
-  mysql -e "CREATE DATABASE IF NOT EXISTS \`$T_DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  mysql -e "CREATE USER IF NOT EXISTS '$T_USER'@'%' IDENTIFIED BY '$T_PASS';" || true
-  mysql -e "GRANT ALL PRIVILEGES ON \`$T_DB\`.* TO '$T_USER'@'%'; FLUSH PRIVILEGES;"
-
-  local dump_cmd
-  if [[ -n "${DB_PASS:-}" ]]; then
-    dump_cmd="mysqldump -u\"$DB_USER\" -p\"$DB_PASS\" --single-transaction --quick --routines --triggers --events \"$DB_NAME\" | gzip -1"
-  else
-    dump_cmd="mysqldump -u\"${DB_USER:-root}\" --single-transaction --quick --routines --triggers --events \"$DB_NAME\" | gzip -1"
-  fi
-
-  notify "Menarik & import DB..."
-  local status=0
-  if ! remote_marked "$dump_cmd" | gzip -d | mysql "$T_DB"; then
-    err "Import DB gagal"
-    status=1
-  else
-    notify "Import DB selesai → target: $T_DB (user=$T_USER)"
-    save_profile
-
-
-    # Patch wp-config.php target (jika ada)
-    if [[ -f "$DST_WEBROOT/wp-config.php" ]]; then
-      sed -ri "s/define\('DB_NAME',[[:space:]]*'[^']*'\)/define('DB_NAME', '$T_DB')/" "$DST_WEBROOT/wp-config.php" || true
-      sed -ri "s/define\('DB_USER',[[:space:]]*'[^']*'\)/define('DB_USER', '$T_USER')/" "$DST_WEBROOT/wp-config.php" || true
-      sed -ri "s/define\('DB_PASSWORD',[[:space:]]*'[^']*'\)/define('DB_PASSWORD', '$T_PASS')/" "$DST_WEBROOT/wp-config.php" || true
-    fi
-  fi
-
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return $status
-}
-
-nginx_menu(){
-
-
-
-  local mode="${1:-}" auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  local yn
-  if [[ $auto -eq 1 ]]; then
-    if [[ "$NO_NGINX" == "1" ]]; then
-      log "Mode auto: konfigurasi Nginx dilewati karena NO_NGINX=1."
+# Create a tar.gz of the site's webroot
+tar_webroot_export() {
+  local site_dir="$1" site_name="$2"
+  local out="$EXPORT_DIR/${site_name}.webroot.tar.gz"
+  log "[$site_name] Creating webroot archive -> $out"
+  local attempt=0
+  while (( attempt <= RETRY_EXPORT )); do
+    if tar -C "$(dirname "$site_dir")" -cf - "$(basename "$site_dir")" | gzip -c > "$out"; then
+      ok "[$site_name] Webroot archive created"
       return 0
     fi
-    yn="Y"
-  else
-    read -r -p "Tulis block Nginx? (Y/n) [Y]: " yn
-    yn="${yn:-Y}"
-  fi
-  if [[ "$yn" =~ ^[Nn]$ ]]; then
-    NO_NGINX="1"
-    save_profile
+    # increment attempt counter safely
+    attempt=$((attempt+1))
+    warn "[$site_name] Tar failed (attempt $attempt), retrying..."
+    sleep 2
+  done
+  err "[$site_name] Failed to tar webroot after $RETRY_EXPORT retries"
+  return 1
+}
 
-
-    if [[ $auto -ne 1 ]]; then pause; fi
+# Transfer a file to the remote server. Uses scp first, then falls back
+# to ssh+cat to avoid MOTD/banners if scp fails.
+copy_file_export() {
+  local local_file="$1" remote_file="$2"
+  # scp quiet
+  if scp -q -P "$DEST_PORT" "$local_file" "root@$DEST_HOST:$remote_file" >/dev/null 2>&1; then
     return 0
   fi
-  NO_NGINX="0"
-  save_profile
+  # fallback using ssh+cat
+  if ssh -q -p "$DEST_PORT" "root@$DEST_HOST" "bash --noprofile --norc -c 'cat > \"$remote_file\"'" < "$local_file"; then
+    return 0
+  fi
+  return 1
+}
 
-  local SOCK; SOCK="$(phpfpm_sock_guess)"
-  local SCONF="/etc/nginx/sites-available/${SUBDOMAIN}.conf"
-  [[ -z "$DST_WEBROOT" ]] && DST_WEBROOT="/var/www/${SUBDOMAIN}"
-  if [[ ! -f "$SCONF" ]]; then
-    cat > "$SCONF" <<CONF
+# Transfer both DB dump and webroot archive for a site
+transfer_site_export() {
+  local site_name="$1"
+  local sql="$EXPORT_DIR/${site_name}.sql.gz"
+  local tar="$EXPORT_DIR/${site_name}.webroot.tar.gz"
+  if [[ -f "$sql" ]]; then
+    log "[$site_name] Transferring SQL dump to $DEST_HOST:$DEST_DIR"
+    local attempt=0
+    while (( attempt <= RETRY_EXPORT )); do
+      if copy_file_export "$sql" "$DEST_DIR/$(basename "$sql")"; then
+        ok "[$site_name] SQL transferred"
+        break
+      fi
+        # increment attempt counter safely
+        attempt=$((attempt+1))
+      warn "[$site_name] SQL transfer failed (attempt $attempt), retrying..."
+      sleep 2
+    done
+  else
+    warn "[$site_name] SQL dump missing, skipping SQL transfer"
+  fi
+  if [[ -f "$tar" ]]; then
+    log "[$site_name] Transferring webroot archive to $DEST_HOST:$DEST_DIR"
+    local attempt=0
+    while (( attempt <= RETRY_EXPORT )); do
+      if copy_file_export "$tar" "$DEST_DIR/$(basename "$tar")"; then
+        ok "[$site_name] Webroot transferred"
+        break
+      fi
+      # increment attempt counter safely
+      attempt=$((attempt+1))
+      warn "[$site_name] Webroot transfer failed (attempt $attempt), retrying..."
+      sleep 2
+    done
+  else
+    warn "[$site_name] Webroot archive missing, skipping webroot transfer"
+  fi
+}
+
+# Interactive menu for export operations
+menu_export() {
+  require_cmds_export
+  # Prompt for destination host if not preset
+  if [[ -z "$DEST_HOST" ]]; then
+    read -r -p "Masukkan IP/hostname server baru: " DEST_HOST
+    if [[ -z "$DEST_HOST" ]]; then
+      err "Destination host must be provided."; return
+    fi
+  fi
+  # Port
+  read -r -p "Masukkan port SSH server baru [$DEST_PORT]: " tmp_port
+  DEST_PORT="${tmp_port:-$DEST_PORT}"
+  # Directory
+  read -r -p "Masukkan folder tujuan di server baru [$DEST_DIR]: " tmp_dir
+  DEST_DIR="${tmp_dir:-$DEST_DIR}"
+  # List sites
+  list_sites_export
+  local count=${#SITES_EXPORT[@]}
+  if (( count == 0 )); then
+    err "Tidak ditemukan wp-config.php di $WEBROOT_BASE_EXPORT"
+    return
+  fi
+  log "Ditemukan $count WordPress site:"
+  # display numbered list of exportable sites
+  local i=0
+  for path in "${SITES_EXPORT[@]}"; do
+    # increment i explicitly rather than relying on ((i++)) which may return non-zero
+    i=$((i+1))
+    printf "  %2d) %s (%s)\n" "$i" "$(basename "$path")" "$path"
+  done
+  echo
+  read -r -p "Masukkan nomor site (pisah koma) atau ALL [ALL]: " pick
+  pick="${pick:-ALL}"
+  local selections=()
+  if [[ "$pick" =~ ^([Aa][Ll][Ll])$ ]]; then
+    for ((j=1; j<=count; j++)); do selections+=("$j"); done
+  else
+    IFS=',' read -ra selections <<<"$pick"
+  fi
+  mkdir -p "$EXPORT_DIR"
+  ensure_dest_ready
+  for sel in "${selections[@]}"; do
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > count )); then
+      warn "Nomor tidak valid: $sel"; continue
+    fi
+    local dir="${SITES_EXPORT[$((sel-1))]}"
+    local name; name="$(basename "$dir")"
+    log "--- Menangani [$name] ---"
+    dump_db_export "$dir" "$name" || warn "[$name] DB dump error"
+    tar_webroot_export "$dir" "$name" || warn "[$name] Tar error"
+    transfer_site_export "$name" || warn "[$name] Transfer error"
+    ok "[$name] Ekspor selesai"
+  done
+  ok "Ekspor selesai. File lokal di $EXPORT_DIR; file remote di $DEST_HOST:$DEST_DIR"
+}
+
+# ---------------------------------------------------------------------
+# Import functions (run on new server)
+# ---------------------------------------------------------------------
+
+# Import defaults
+IMPORT_DIR="${IMPORT_DIR:-/root/wp_imports}"
+WEBROOT_BASE_IMPORT="${WEBROOT_BASE_IMPORT:-/var/www}"
+NGINX_AVAIL="${NGINX_AVAIL:-/etc/nginx/sites-available}"
+NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
+DEFAULT_PHP_VERSION="${DEFAULT_PHP_VERSION:-}"
+SERVER_IP_HINT="${SERVER_IP_HINT:-}"
+
+# Ensure required commands on import side
+require_cmds_import() {
+  local cmds=(tar gzip awk sed grep ln systemctl)
+  local missing=()
+  for c in "${cmds[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if ((${#missing[@]})); then
+    err "Missing commands: ${missing[*]}"
+    echo "Install them first." >&2
+    exit 1
+  fi
+  command -v nginx >/dev/null 2>&1 || warn "nginx not found in PATH"
+  command -v mysql >/dev/null 2>&1 || warn "mysql not found in PATH"
+}
+
+# Detect PHP-FPM socket; return empty if not found
+detect_php_fpm_socket() {
+  if [[ -n "$DEFAULT_PHP_VERSION" ]]; then
+    local sock="/run/php/php${DEFAULT_PHP_VERSION}-fpm.sock"
+    [[ -S "$sock" ]] && { echo "$sock"; return; }
+  fi
+  local cand
+  cand="$(ls -1 /run/php/php*-fpm.sock 2>/dev/null | sort -Vr | head -n1 || true)"
+  [[ -S "$cand" ]] && echo "$cand" || echo ""
+}
+
+# Ask the user (or auto-detect) for the PHP-FPM version
+prompt_php_version_if_needed() {
+  # Determine the PHP-FPM version to use for nginx fastcgi_pass
+  # First try auto-detecting an existing php*-fpm socket. If that fails, use
+  # DEFAULT_PHP_VERSION if set, otherwise fall back to 8.3.  We avoid
+  # prompting the user inside automated import routines.
+  local sock
+  sock="$(detect_php_fpm_socket || true)"
+  if [[ -z "$sock" ]]; then
+    # If the caller has set DEFAULT_PHP_VERSION, try that
+    local fallback="${DEFAULT_PHP_VERSION:-}"
+    # If no fallback yet, default to 8.3
+    [[ -z "$fallback" ]] && fallback="8.3"
+    sock="/run/php/php${fallback}-fpm.sock"
+    if [[ ! -S "$sock" ]]; then
+      warn "Tidak dapat menemukan socket PHP-FPM otomatis; mencoba fallback php${fallback}-fpm.sock yang tidak ada."
+      # leave DEFAULT_PHP_VERSION blank so downstream can handle missing fastcgi
+      DEFAULT_PHP_VERSION="$fallback"
+    else
+      DEFAULT_PHP_VERSION="$fallback"
+    fi
+  else
+    # Parse version from socket filename (supports php8.3-fpm.sock and php8.3-fpm.sock variants)
+    local base
+    base="$(basename "$sock")"
+    DEFAULT_PHP_VERSION="$(printf '%s' "$base" | sed -nE 's/^php([0-9]+\.[0-9]+)-fpm\.sock$/\1/p')"
+    # Fallback: if pattern didn't match, strip prefix/suffix crudely
+    [[ -z "$DEFAULT_PHP_VERSION" ]] && DEFAULT_PHP_VERSION="$(printf '%s' "$base" | sed -nE 's/^php(.*)-fpm\.sock$/\1/p')"
+  fi
+  ok "PHP-FPM versi digunakan: ${DEFAULT_PHP_VERSION:-<none>}"
+}
+
+# MySQL root login
+MYSQL_ROOT_ARGS=()
+check_mysql_root() {
+  # Try without password first
+  if mysql -uroot -e "SELECT 1" >/dev/null 2>&1; then
+    MYSQL_ROOT_ARGS=(-uroot)
+    return
+  fi
+  read -r -s -p "Masukkan password MySQL root: " mpass; echo
+  MYSQL_ROOT_ARGS=(-uroot "-p${mpass}")
+  if ! mysql "${MYSQL_ROOT_ARGS[@]}" -e "SELECT 1" >/dev/null 2>&1; then
+    err "Login MySQL root gagal"
+    exit 1
+  fi
+}
+
+mysql_exec() { mysql "${MYSQL_ROOT_ARGS[@]}" -e "$1"; }
+
+ensure_db_and_user() {
+  local db="$1" user="$2" pass="$3"
+  mysql_exec "CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  mysql_exec "CREATE USER IF NOT EXISTS '$user'@'localhost' IDENTIFIED BY '$pass';"
+  mysql_exec "ALTER USER '$user'@'localhost' IDENTIFIED BY '$pass';"
+  mysql_exec "GRANT ALL PRIVILEGES ON \`$db\`.* TO '$user'@'localhost'; FLUSH PRIVILEGES;"
+  ok "Database dan user disiapkan: $db / $user"
+}
+
+import_sql_gz() {
+  local db="$1" file="$2"
+  if [[ ! -f "$file" ]]; then warn "File SQL tidak ditemukan: $file"; return 1; fi
+  log "Impor SQL ke DB $db dari file $(basename "$file")"
+  if ! gzip -dc "$file" | mysql "${MYSQL_ROOT_ARGS[@]}" "$db"; then
+    err "Impor SQL gagal: $file"
+    return 1
+  fi
+  ok "Impor SQL selesai"
+}
+
+# Create nginx server block
+gen_nginx_server_block() {
+  local site="$1" root="$2" php_ver="$3"
+  # Sanitize the site name for filesystem usage: replace any unsafe char with '_'.
+  local sanitized
+  sanitized=$(printf '%s' "$site" | sed 's/[^A-Za-z0-9._-]/_/g')
+  local conf="$NGINX_AVAIL/$sanitized"
+  local sock="/run/php/php${php_ver}-fpm.sock"
+  # Remove any existing symlink with the original site name to avoid stale/broken configs
+  rm -f "$NGINX_ENABLED/$site" 2>/dev/null || true
+  # Generate nginx server block
+  cat > "$conf" <<NGX
 server {
     listen 80;
-    server_name ${SUBDOMAIN};
-    root ${DST_WEBROOT};
+    server_name ${site};
+    root ${root};
     index index.php index.html;
 
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    client_max_body_size 64m;
 
-    location ~ \\.php$ {
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:${SOCK};
+        fastcgi_pass unix:${sock};
     }
 
-    location ~* \\.(jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?)$ {
-        expires max; access_log off; log_not_found off;
+    location ~* \.(jpg|jpeg|png|gif|svg|webp|ico|css|js|woff2?|ttf)\$ {
+        expires 7d;
+        access_log off;
+        try_files \$uri =404;
     }
 }
-CONF
-    ln -sf "$SCONF" "/etc/nginx/sites-enabled/${SUBDOMAIN}.conf"
-  fi
-
-  local status=0
+NGX
+  # Symlink into sites-enabled using sanitized filename
+  ln -sf "$conf" "$NGINX_ENABLED/$sanitized"
   if nginx -t; then
-    systemctl reload nginx || { warn "Nginx reload gagal; cek config."; status=1; }
+    systemctl reload nginx || true
+    ok "Nginx block dibuat dan reload: $site"
   else
-    warn "Nginx test gagal; periksa konfigurasi."
-    status=1
+    err "nginx -t gagal untuk $site"
+    return 1
   fi
-
-
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return $status
 }
 
-finalize_menu(){
-
-
-
-  local mode="${1:-}" auto=0
-  [[ "$mode" == "--auto" ]] && auto=1
-
-  [[ -z "$DST_WEBROOT" ]] && DST_WEBROOT="/var/www/${SUBDOMAIN}"
-  chown -R www-data:www-data "$DST_WEBROOT" || true
-  systemctl list-units | grep -Eo 'php[0-9.]+-fpm\.service' | sort -u | xargs -r -n1 systemctl reload || true
-  notify "Selesai. Arahkan DNS A record ${SUBDOMAIN} ke IP server baru saat siap cutover."
-  log "Log selesai: $LOG_FILE"
-
-
-
-  if [[ $auto -ne 1 ]]; then
-    pause
-  fi
-  return 0
+# Fix file ownership and permissions
+fix_permissions() {
+  local path="$1"
+  chown -R www-data:www-data "$path"
+  find "$path" -type d -exec chmod 755 {} \;
+  find "$path" -type f -exec chmod 644 {} \;
+  ok "Permissions diperbaiki: $path"
 }
 
-one_click_run(){
-  if ! ensure_source_connection_ready; then
-    pause
-    return
+# List import packages (sites)
+list_packages() {
+  # Safely list available import packages. If the directory doesn't exist, return nothing.
+  if [[ ! -d "$IMPORT_DIR" ]]; then
+    return 0
   fi
-
-  if ! deps_menu --auto; then
-    err "Langkah dependencies gagal. Periksa menu 1."
-    pause
-    return
-  fi
-
-  if ! test_connect_menu --auto; then
-    err "Tes SSH gagal. Pastikan kredensial benar di menu 2."
-    pause
-    return
-  fi
-
-  if ! detect_webroot_menu --auto; then
-    err "Deteksi webroot gagal. Jalankan menu 6 secara manual."
-    pause
-    return
-  fi
-
-  if ! detect_db_menu --auto; then
-    err "Deteksi database gagal. Periksa menu 7."
-    pause
-    return
-  fi
-
-  if ! migrate_files_menu --auto; then
-    err "Penarikan file gagal. Coba ulang dari menu 8."
-    pause
-    return
-  fi
-
-  if ! import_db_menu --auto; then
-    err "Import database gagal. Coba ulang dari menu 9."
-    pause
-    return
-  fi
-
-  if ! nginx_menu --auto; then
-    err "Penulisan block Nginx gagal. Revisi di menu 10."
-    pause
-    return
-  fi
-
-  if ! finalize_menu --auto; then
-    err "Finalize gagal. Jalankan menu 11 untuk detail."
-    pause
-    return
-  fi
-
-  notify "ONE-CLICK selesai tanpa error kritis."
-  pause
+  # Use find instead of ls so that no-match patterns do not cause the pipeline to fail under set -e/pipefail
+  find "$IMPORT_DIR" -maxdepth 1 -type f -name '*.webroot.tar.gz' -printf '%f\n' 2>/dev/null \
+    | sed -nE 's/^(.*)\.webroot\.tar\.gz$/\1/p' | sort -u
 }
 
-# ====== UI ======
-main_menu(){
+has_sql() { [[ -f "${IMPORT_DIR}/$1.sql.gz" ]]; }
+has_tar() { [[ -f "${IMPORT_DIR}/$1.webroot.tar.gz" ]]; }
+
+# Process one site during import
+process_site_import() {
+  local site="$1"
+  local tarf="${IMPORT_DIR}/${site}.webroot.tar.gz"
+  local sqlf="${IMPORT_DIR}/${site}.sql.gz"
+  local dst="${WEBROOT_BASE_IMPORT}/${site}"
+  log "=== Import ${site} ==="
+  # Extract webroot
+  if [[ -d "$dst" ]]; then
+    local backup="${dst}.$(date +%Y%m%d%H%M%S).bak"
+    warn "Folder $dst sudah ada; backup ke $backup"
+    mv "$dst" "$backup"
+  fi
+  mkdir -p "$WEBROOT_BASE_IMPORT"
+  log "[${site}] Ekstrak webroot -> $dst"
+  tar -C "$WEBROOT_BASE_IMPORT" -xzf "$tarf"
+  ok "[${site}] Ekstrak webroot selesai"
+  # Parse credentials from wp-config.php
+  local cfg="$dst/wp-config.php"
+  local db_name db_user db_pass db_host
+  db_name="$(parse_define "$cfg" DB_NAME || true)"
+  db_user="$(parse_define "$cfg" DB_USER || true)"
+  db_pass="$(parse_define "$cfg" DB_PASSWORD || true)"
+  db_host="$(parse_define "$cfg" DB_HOST || true)"
+  if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
+    warn "[${site}] Kredensial tidak lengkap di wp-config.php"
+    read -r -p "Masukkan DB_NAME untuk ${site}: " db_name
+    read -r -p "Masukkan DB_USER untuk ${site}: " db_user
+    read -r -s -p "Masukkan DB_PASSWORD untuk ${site}: " db_pass; echo
+    db_host="${db_host:-localhost}"
+    # Write credentials back into wp-config.php
+    sed -i "s/define\\s*('\?DB_NAME'\\?,\\s*'.*');/define( 'DB_NAME', '${db_name}' );/I" "$cfg" || true
+    sed -i "s/define\\s*('\?DB_USER'\\?,\\s*'.*');/define( 'DB_USER', '${db_user}' );/I" "$cfg" || true
+    sed -i "s/define\\s*('\?DB_PASSWORD'\\?,\\s*'.*');/define( 'DB_PASSWORD', '${db_pass}' );/I" "$cfg" || true
+    if [[ -n "$db_host" ]]; then
+      sed -i "s/define\\s*('\?DB_HOST'\\?,\\s*'.*');/define( 'DB_HOST', '${db_host}' );/I" "$cfg" || true
+    fi
+    ok "[${site}] wp-config.php updated with new credentials"
+  fi
+  db_host="${db_host:-localhost}"
+  # Prepare DB
+  check_mysql_root
+  ensure_db_and_user "$db_name" "$db_user" "$db_pass"
+  # Import SQL
+  if [[ -f "$sqlf" ]]; then
+    import_sql_gz "$db_name" "$sqlf" || warn "[${site}] Gagal impor SQL"
+  else
+    warn "[${site}] File SQL tidak ditemukan; lewati impor DB"
+  fi
+  # Fix permissions
+  fix_permissions "$dst"
+  # Nginx
+  prompt_php_version_if_needed
+  # Generate nginx server block; if it fails, log a warning instead of exiting
+  if ! gen_nginx_server_block "$site" "$dst" "$DEFAULT_PHP_VERSION"; then
+    warn "[${site}] Gagal membuat nginx block, periksa konfigurasi secara manual"
+  fi
+  log "--- Selesai import ${site} ---"
+  [[ -n "$SERVER_IP_HINT" ]] && echo "Atur DNS ${site} -> ${SERVER_IP_HINT}"
+  echo
+}
+
+# Import a site in replace mode: only replace the files and database of an existing site on the destination server.
+# This function will:
+#   * Read database credentials from the existing site's wp-config.php
+#   * Backup the current webroot and extract the imported package
+#   * Update the imported wp-config.php to use the original database credentials
+#   * Ensure the database and user exist, then import the SQL dump
+#   * Fix filesystem permissions
+#   * Skip generating nginx configuration
+
+process_site_replace_import() {
+  local site="$1"
+  local tarf="${IMPORT_DIR}/${site}.webroot.tar.gz"
+  local sqlf="${IMPORT_DIR}/${site}.sql.gz"
+  local dst="${WEBROOT_BASE_IMPORT}/${site}"
+  log "=== Replace import ${site} ==="
+  if [[ ! -d "$dst" ]]; then
+    err "Direktori situs belum ada: $dst. Buat terlebih dahulu sebelum replace."
+    return 1
+  fi
+  # Read original DB credentials from existing wp-config.php
+  local orig_cfg="$dst/wp-config.php"
+  local orig_db_name="" orig_db_user="" orig_db_pass="" orig_db_host=""
+  if [[ -f "$orig_cfg" ]]; then
+    orig_db_name="$(parse_define "$orig_cfg" DB_NAME || true)"
+    orig_db_user="$(parse_define "$orig_cfg" DB_USER || true)"
+    orig_db_pass="$(parse_define "$orig_cfg" DB_PASSWORD || true)"
+    orig_db_host="$(parse_define "$orig_cfg" DB_HOST || true)"
+  fi
+  [[ -z "$orig_db_host" ]] && orig_db_host="localhost"
+  # Backup existing webroot
+  local backup="${dst}.$(date +%Y%m%d%H%M%S).bak"
+  warn "[$site] Direktori ada; backup ke $backup"
+  mv "$dst" "$backup"
+  # Extract new webroot
+  mkdir -p "$WEBROOT_BASE_IMPORT"
+  log "[$site] Ekstrak webroot -> $dst"
+  tar -C "$WEBROOT_BASE_IMPORT" -xzf "$tarf"
+  ok "[$site] Ekstrak webroot selesai"
+  # Update new wp-config.php with original DB credentials
+  local new_cfg="$dst/wp-config.php"
+  if [[ -f "$new_cfg" && -n "$orig_db_name" && -n "$orig_db_user" && -n "$orig_db_pass" ]]; then
+    sed -i "s/define\s*(\'?DB_NAME\'?\s*,\s*'.*');/define( 'DB_NAME', '${orig_db_name}' );/I" "$new_cfg" || true
+    sed -i "s/define\s*(\'?DB_USER\'?\s*,\s*'.*');/define( 'DB_USER', '${orig_db_user}' );/I" "$new_cfg" || true
+    sed -i "s/define\s*(\'?DB_PASSWORD\'?\s*,\s*'.*');/define( 'DB_PASSWORD', '${orig_db_pass}' );/I" "$new_cfg" || true
+    if [[ -n "$orig_db_host" ]]; then
+      sed -i "s/define\s*(\'?DB_HOST\'?\s*,\s*'.*');/define( 'DB_HOST', '${orig_db_host}' );/I" "$new_cfg" || true
+    fi
+    ok "[$site] wp-config.php disesuaikan dengan kredensial DB asli"
+  else
+    warn "[$site] Tidak menemukan kredensial DB asli; wp-config.php tidak diubah"
+  fi
+  # Ensure DB exists and import SQL (using root)
+  if [[ -n "$orig_db_name" && -n "$orig_db_user" && -n "$orig_db_pass" ]]; then
+    check_mysql_root
+    ensure_db_and_user "$orig_db_name" "$orig_db_user" "$orig_db_pass"
+    if [[ -f "$sqlf" ]]; then
+      import_sql_gz "$orig_db_name" "$sqlf" || warn "[$site] Gagal impor SQL"
+    else
+      warn "[$site] File SQL tidak ditemukan; lewati impor DB"
+    fi
+  else
+    warn "[$site] Kredensial DB tidak lengkap; lewati impor DB"
+  fi
+  # Fix permissions
+  fix_permissions "$dst"
+  log "--- Selesai replace import ${site} ---"
+}
+
+# Interactive menu for import operations
+menu_import() {
+  require_cmds_import
   while true; do
     clear
-    echo "==================== SUBDOMAIN PULL MIGRATION (MENU) ===================="
-    echo "Subdomain : ${SUBDOMAIN:-<belum>}"
-    echo "Source    : ${SRC_USER:-?}@${SRC_HOST:-?}:${SRC_PORT:-?}"
-    echo "Webroot   : SRC=${SRC_WEBROOT:-<auto>}  DST=${DST_WEBROOT:-/var/www/<subdomain>}"
-    echo "DB        : WANT_DB=${WANT_DB}  SRC=${DB_NAME:-<auto>}  TARGET=${T_DB:-<auto>}"
-    echo "Auth      : $( [[ -n "$SSHPASS" ]] && echo 'PASSWORD/sshpass' || echo 'SSH KEY (BatchMode)')"
-    echo "Log file  : $LOG_FILE"
-    echo "-------------------------------------------------------------------------"
-    if [[ -z "$SRC_HOST" || -z "$SUBDOMAIN" ]]; then
-      echo "NOTE: Jalankan menu '2) Set Source Connection (Quick)' sebelum ONE-CLICK."
-    fi
-    echo " 1) Dependencies Check"
-
-
-    echo " 2) Set Source Connection"
-    echo " 3) New Profile"
-    echo " 4) Load Profile"
-    echo " 5) Test SSH Connectivity"
-    echo " 6) Detect Webroot (Nginx)"
-    echo " 7) Detect DB (wp-config.php)"
-    echo " 8) Migrate Files"
-    echo " 9) Import Database"
-    echo "10) Write Nginx Block"
-    echo "11) Finalize (Ownership + Reload)"
-    echo "12) ONE-CLICK RUN (Deps→Finalize)"
-    echo " 0) Exit"
-    echo "-------------------------------------------------------------------------"
-    read -r -p "Pilih menu [0-12]: " ans
+    echo "------------------- MENU IMPOR -------------------"
+    echo "Directory paket : $IMPORT_DIR"
+    echo "Root web        : $WEBROOT_BASE_IMPORT"
+    echo "PHP-FPM version : ${DEFAULT_PHP_VERSION:-auto}"
+    [[ -n "$SERVER_IP_HINT" ]] && echo "IP hint         : $SERVER_IP_HINT"
+    echo "--------------------------------------------------"
+    echo "1) Daftar paket"
+    echo "2) Import situs"
+    echo "3) Regenerate nginx"
+    echo "4) Perbaiki permissions"
+    echo "5) Bersihkan banner/MOTD"
+    echo "0) Kembali"
+    read -r -p "Pilih [0-5]: " ans
     case "$ans" in
-      1) deps_menu ;;
-      2) source_connection_menu ;;
-      3) new_profile_menu ;;
-      4) load_profile_menu ;;
-      5) test_connect_menu ;;
-      6) detect_webroot_menu ;;
-      7) detect_db_menu ;;
-      8) migrate_files_menu ;;
-      9) import_db_menu ;;
-     10) nginx_menu ;;
-     11) finalize_menu ;;
-     12) one_click_run ;;
-      0) exit 0 ;;
-      *) echo "Pilihan tidak dikenal"; pause ;;
+      1)
+        log "Paket yang tersedia:"
+        local any=0
+        while IFS= read -r s; do
+          any=1
+          local flags=""
+          has_tar "$s" && flags="WEBROOT"
+          has_sql "$s" && flags="${flags}${flags:++}SQL"
+          printf "  - %-30s [%s]\n" "$s" "$flags"
+        done < <(list_packages)
+        [[ $any -eq 0 ]] && warn "Tidak ada paket."
+        read -r -p "Enter untuk kembali..." _;;
+      2)
+        local sites=(); while IFS= read -r s; do sites+=("$s"); done < <(list_packages)
+        local total=${#sites[@]}
+        if (( total == 0 )); then warn "Tidak ada paket."; read -r -p "Enter..." _; continue; fi
+        log "Pilih situs untuk import:"
+        local i=1; for s in "${sites[@]}"; do printf "  %2d) %s\n" "$i" "$s"; i=$((i+1)); done
+        read -r -p "Masukkan nomor (pisah koma) atau ALL [ALL]: " pick
+        pick="${pick:-ALL}"
+        local sel_idxs=()
+        if [[ "$pick" =~ ^([Aa][Ll][Ll])$ ]]; then
+          for ((j=1;j<=total;j++)); do sel_idxs+=("$j"); done
+        else
+          IFS=',' read -ra sel_idxs <<<"$pick"
+        fi
+        # Ask whether to replace existing sites (skip nginx/php/ssl config) or perform full import
+        local replace_choice
+        read -r -p "Gunakan mode replace (hanya ganti data & file, tanpa konfigurasi)? [y/N]: " replace_choice
+        replace_choice="${replace_choice:-N}"
+        for idx_sel in "${sel_idxs[@]}"; do
+          if ! [[ "$idx_sel" =~ ^[0-9]+$ ]] || (( idx_sel < 1 || idx_sel > total )); then
+            warn "Nomor tidak valid: $idx_sel"; continue
+          fi
+          local site_name="${sites[$((idx_sel-1))]}"
+          if [[ "$replace_choice" =~ ^[Yy]$ ]]; then
+            process_site_replace_import "$site_name" || warn "Replace import bermasalah untuk $site_name"
+          else
+            process_site_import "$site_name" || warn "Import bermasalah untuk $site_name"
+          fi
+        done
+        read -r -p "Selesai import. Enter untuk kembali..." _;;
+      3)
+        # regenerate nginx
+        prompt_php_version_if_needed
+        local sites=(); while IFS= read -r s; do sites+=("$s"); done < <(list_packages)
+        local total=${#sites[@]}
+        if (( total == 0 )); then warn "Tidak ada paket."; read -r -p "Enter..." _; continue; fi
+        log "Pilih situs untuk regenerate nginx:"
+        local i=1; for s in "${sites[@]}"; do printf "  %2d) %s\n" "$i" "$s"; i=$((i+1)); done
+        read -r -p "Masukkan nomor (pisah koma) atau ALL [ALL]: " pick
+        pick="${pick:-ALL}"
+        local sel_idxs=()
+        if [[ "$pick" =~ ^([Aa][Ll][Ll])$ ]]; then
+          for ((j=1;j<=total;j++)); do sel_idxs+=("$j"); done
+        else
+          IFS=',' read -ra sel_idxs <<<"$pick"
+        fi
+        for idx_sel in "${sel_idxs[@]}"; do
+          if ! [[ "$idx_sel" =~ ^[0-9]+$ ]] || (( idx_sel < 1 || idx_sel > total )); then
+            warn "Nomor tidak valid: $idx_sel"; continue
+          fi
+          local site="${sites[$((idx_sel-1))]}"
+          gen_nginx_server_block "$site" "$WEBROOT_BASE_IMPORT/$site" "$DEFAULT_PHP_VERSION" || warn "Regenerate gagal: $site"
+        done
+        read -r -p "Regenerate selesai. Enter untuk kembali..." _;;
+      4)
+        local sites=(); while IFS= read -r s; do sites+=("$s"); done < <(list_packages)
+        local total=${#sites[@]}
+        if (( total == 0 )); then warn "Tidak ada paket."; read -r -p "Enter..." _; continue; fi
+        log "Pilih situs untuk perbaiki permissions:"
+        local i=1; for s in "${sites[@]}"; do printf "  %2d) %s\n" "$i" "$s"; i=$((i+1)); done
+        read -r -p "Masukkan nomor (pisah koma) atau ALL [ALL]: " pick
+        pick="${pick:-ALL}"
+        local sel_idxs=()
+        if [[ "$pick" =~ ^([Aa][Ll][Ll])$ ]]; then
+          for ((j=1;j<=total;j++)); do sel_idxs+=("$j"); done
+        else
+          IFS=',' read -ra sel_idxs <<<"$pick"
+        fi
+        for idx_sel in "${sel_idxs[@]}"; do
+          if ! [[ "$idx_sel" =~ ^[0-9]+$ ]] || (( idx_sel < 1 || idx_sel > total )); then
+            warn "Nomor tidak valid: $idx_sel"; continue
+          fi
+          fix_permissions "$WEBROOT_BASE_IMPORT/${sites[$((idx_sel-1))]}"
+        done
+        read -r -p "Permissions selesai. Enter untuk kembali..." _;;
+      5)
+        clean_banner
+        read -r -p "Banner dibersihkan. Enter untuk kembali..." _;;
+      0)
+        break;;
+      *) warn "Pilihan tidak dikenal"; sleep 1;;
     esac
   done
 }
 
-trap 'notify "❌ Terjadi error. Lihat log: '"$LOG_FILE"'"' ERR
-main_menu
+# ---------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------
+
+while true; do
+  echo
+  echo "============== WORDPRESS MIGRATION MENU =============="
+  show_usage
+  read -r -p "Pilih opsi [0-3]: " choice
+  case "$choice" in
+    1) menu_export ;;
+    2) menu_import ;;
+    3) clean_banner ;;
+    0) echo "Keluar."; exit 0 ;;
+    *) warn "Pilihan tidak dikenal. Coba lagi." ;;
+  esac
+done
