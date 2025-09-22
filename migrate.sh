@@ -792,6 +792,202 @@ process_site_replace_import() {
   log "--- Selesai replace import ${site} ---"
 }
 
+replace_domain_menu() {
+  local sites=()
+  if [[ -d "$WEBROOT_BASE_IMPORT" ]]; then
+    while IFS= read -r s; do sites+=("$s"); done < <(find "$WEBROOT_BASE_IMPORT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+  fi
+  if (( ${#sites[@]} == 0 )); then
+    while IFS= read -r s; do sites+=("$s"); done < <(list_packages)
+  fi
+  local total=${#sites[@]}
+  if (( total == 0 )); then
+    warn "Tidak ada situs yang ditemukan untuk ganti domain."
+    read -r -p "Enter untuk kembali..." _
+    return
+  fi
+  log "Pilih situs untuk ganti domain:"
+  local i=1
+  for s in "${sites[@]}"; do
+    printf "  %2d) %s\n" "$i" "$s"
+    i=$((i+1))
+  done
+  read -r -p "Masukkan nomor (pisah koma) atau ALL [ALL]: " pick
+  pick="${pick:-ALL}"
+  local sel_idxs=()
+  if [[ "$pick" =~ ^([Aa][Ll][Ll])$ ]]; then
+    for ((j=1;j<=total;j++)); do sel_idxs+=("$j"); done
+  else
+    IFS=',' read -ra sel_idxs <<<"$pick"
+  fi
+  local mysql_ready=0
+  for idx_sel in "${sel_idxs[@]}"; do
+    idx_sel="${idx_sel//[[:space:]]/}"
+    if ! [[ "$idx_sel" =~ ^[0-9]+$ ]] || (( idx_sel < 1 || idx_sel > total )); then
+      warn "Nomor tidak valid: $idx_sel"
+      continue
+    fi
+    local site="${sites[$((idx_sel-1))]}"
+    local base_dir="$WEBROOT_BASE_IMPORT/$site"
+    local wp_dir=""
+    if [[ -d "$base_dir" && -f "$base_dir/wp-config.php" ]]; then
+      wp_dir="$base_dir"
+    elif [[ -d "$base_dir" ]]; then
+      wp_dir="$(find "$base_dir" -maxdepth 2 -type f -name 'wp-config.php' -printf '%h\n' 2>/dev/null | head -n1 || true)"
+    else
+      warn "[$site] Direktori tidak ditemukan di $WEBROOT_BASE_IMPORT"
+    fi
+    if [[ -z "$wp_dir" ]]; then
+      warn "[$site] wp-config.php tidak ditemukan; lewati."
+      continue
+    fi
+    log "[$site] WordPress root: $wp_dir"
+    local old_domain new_domain
+    read -r -p "[$site] Domain lama: " old_domain
+    read -r -p "[$site] Domain baru: " new_domain
+    if [[ -z "$old_domain" || -z "$new_domain" ]]; then
+      warn "[$site] Domain lama/baru tidak boleh kosong"
+      continue
+    fi
+    read -r -p "Konfirmasi ganti domain $old_domain -> $new_domain untuk $site? [y/N]: " confirm
+    confirm="${confirm:-N}"
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      warn "[$site] Dibatalkan oleh operator"
+      continue
+    fi
+    log "[$site] Mengganti domain di database..."
+    local replaced_ok=0
+    if command -v wp >/dev/null 2>&1; then
+      if (cd "$wp_dir" && wp search-replace "$old_domain" "$new_domain" --all-tables --skip-columns=guid --allow-root); then
+        ok "[$site] WP-CLI search-replace berhasil"
+        replaced_ok=1
+      else
+        warn "[$site] WP-CLI search-replace gagal; mencoba fallback mysql"
+      fi
+    else
+      warn "[$site] WP-CLI tidak tersedia; menggunakan fallback mysql"
+    fi
+    local fallback_success=0
+    if (( replaced_ok == 0 )); then
+      local cfg="$wp_dir/wp-config.php"
+      local db_name db_host table_prefix
+      db_name="$(parse_define "$cfg" DB_NAME || true)"
+      db_host="$(parse_define "$cfg" DB_HOST || true)"
+      table_prefix="$(grep -E "^\s*\$table_prefix\s*=" "$cfg" 2>/dev/null | sed -nE "s/^\s*\$table_prefix\s*=\s*['\"]([^'\"]+)['\"].*/\1/p" | head -n1 || true)"
+      [[ -z "$table_prefix" ]] && table_prefix="wp_"
+      [[ -z "$db_host" ]] && db_host="localhost"
+      if [[ -z "$db_name" ]]; then
+        warn "[$site] DB_NAME tidak ditemukan di wp-config.php; lewati penggantian via mysql"
+      else
+        if (( mysql_ready == 0 )); then
+          check_mysql_root
+          mysql_ready=1
+        fi
+        if [[ "$db_host" != "localhost" && "$db_host" != "127.0.0.1" ]]; then
+          warn "[$site] DB_HOST adalah $db_host; pastikan koneksi root dapat menjangkaunya"
+        fi
+        local old_sql new_sql prefix_mysql
+        old_sql="$(escape_squote "$old_domain")"
+        new_sql="$(escape_squote "$new_domain")"
+        prefix_mysql="${table_prefix//\`/\`\`}"
+        log "[$site] Menjalankan query penggantian via mysql (DB: $db_name, prefix: $table_prefix)"
+        local mysql_ok=1
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}options\` SET option_value = REPLACE(option_value, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}options (abaikan bila tidak ada)"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}posts\` SET post_content = REPLACE(post_content, '${old_sql}', '${new_sql}'), post_excerpt = REPLACE(post_excerpt, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}posts"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}postmeta\` SET meta_value = REPLACE(meta_value, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}postmeta"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}commentmeta\` SET meta_value = REPLACE(meta_value, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}commentmeta (abaikan bila tidak ada)"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}comments\` SET comment_content = REPLACE(comment_content, '${old_sql}', '${new_sql}'), comment_author_url = REPLACE(comment_author_url, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}comments"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}terms\` SET name = REPLACE(name, '${old_sql}', '${new_sql}'), slug = REPLACE(slug, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}terms"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}term_taxonomy\` SET description = REPLACE(description, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}term_taxonomy (abaikan bila tidak ada)"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}usermeta\` SET meta_value = REPLACE(meta_value, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}usermeta (abaikan bila tidak ada)"
+          mysql_ok=0
+        fi
+        if ! mysql "${MYSQL_ROOT_ARGS[@]}" "$db_name" -e "UPDATE \`${prefix_mysql}links\` SET link_url = REPLACE(link_url, '${old_sql}', '${new_sql}'), link_image = REPLACE(link_image, '${old_sql}', '${new_sql}');" >/dev/null 2>&1; then
+          warn "[$site] Gagal memperbarui tabel ${prefix_mysql}links (abaikan bila tidak ada)"
+          mysql_ok=0
+        fi
+        if (( mysql_ok )); then
+          ok "[$site] Penggantian via mysql selesai"
+          fallback_success=1
+        fi
+      fi
+    fi
+    if (( replaced_ok == 0 && fallback_success == 0 )); then
+      warn "[$site] Penggantian domain di database mungkin belum berhasil"
+    fi
+    local nginx_conf=""
+    local sanitized_site sanitized_old
+    sanitized_site="$(printf '%s' "$site" | sed 's/[^A-Za-z0-9._-]/_/g')"
+    sanitized_old="$(printf '%s' "$old_domain" | sed 's/[^A-Za-z0-9._-]/_/g')"
+    if [[ -f "$NGINX_AVAIL/$sanitized_site" ]]; then
+      nginx_conf="$NGINX_AVAIL/$sanitized_site"
+    elif [[ -f "$NGINX_AVAIL/$sanitized_old" ]]; then
+      nginx_conf="$NGINX_AVAIL/$sanitized_old"
+    elif [[ -d "$NGINX_AVAIL" ]]; then
+      nginx_conf="$(grep -l "root[[:space:]]\+$wp_dir;" "$NGINX_AVAIL"/* 2>/dev/null | head -n1 || true)"
+    fi
+    local reload_needed=0
+    if [[ -n "$nginx_conf" ]]; then
+      log "[$site] Memperbarui server_name di $(basename "$nginx_conf")"
+      local escaped_old replacement
+      escaped_old="$(printf '%s\n' "$old_domain" | sed -e 's/[.[\\*^$(){}?+|/]/\\&/g')"
+      replacement="$(printf '%s\n' "$new_domain" | sed -e 's/[\\/&]/\\&/g')"
+      if sed -i "s/${escaped_old}/${replacement}/g" "$nginx_conf"; then
+        reload_needed=1
+      else
+        warn "[$site] Gagal memperbarui file nginx $nginx_conf"
+      fi
+    else
+      log "[$site] Konfigurasi nginx spesifik tidak ditemukan; membuat ulang"
+      prompt_php_version_if_needed
+      if gen_nginx_server_block "$new_domain" "$wp_dir" "$DEFAULT_PHP_VERSION"; then
+        reload_needed=0  # gen_nginx_server_block sudah reload
+      else
+        warn "[$site] Gagal membuat konfigurasi nginx baru"
+      fi
+    fi
+    if (( reload_needed )); then
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx || true
+        ok "[$site] Konfigurasi nginx diperbarui"
+      else
+        warn "[$site] nginx -t gagal setelah memperbarui konfigurasi"
+      fi
+    fi
+    if (( replaced_ok == 1 || fallback_success == 1 )); then
+      ok "[$site] Domain diperbarui menjadi $new_domain"
+    fi
+    if [[ -n "$SERVER_IP_HINT" ]]; then
+      log "[$site] Ingatkan perubahan DNS: arahkan ${new_domain} ke ${SERVER_IP_HINT}"
+    else
+      log "[$site] Ingatkan untuk memperbarui DNS bagi ${new_domain}"
+    fi
+  done
+  read -r -p "Selesai ganti domain. Enter untuk kembali..." _
+}
+
 # Interactive menu for import operations
 menu_import() {
   require_cmds_import
@@ -808,8 +1004,9 @@ menu_import() {
     echo "3) Regenerate nginx"
     echo "4) Perbaiki permissions"
     echo "5) Bersihkan banner/MOTD"
+    echo "6) Ganti domain situs"
     echo "0) Kembali"
-    read -r -p "Pilih [0-5]: " ans
+    read -r -p "Pilih [0-6]: " ans
     case "$ans" in
       1)
         log "Paket yang tersedia:"
@@ -901,6 +1098,8 @@ menu_import() {
       5)
         clean_banner
         read -r -p "Banner dibersihkan. Enter untuk kembali..." _;;
+      6)
+        replace_domain_menu;;
       0)
         break;;
       *) warn "Pilihan tidak dikenal"; sleep 1;;
