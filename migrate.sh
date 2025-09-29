@@ -46,6 +46,7 @@ Menu:
   3) Clean login banner/MOTD on this machine
   4) Delete backup files and archives
   5) Full cleanup: remove all export/import data
+  6) Import package to a new domain (auto URL replace)
   0) Exit
 USAGE
 }
@@ -65,6 +66,32 @@ split_host_port() {
     host="${raw%%:*}"; port="${raw##*:}"
   fi
   printf '%s %s' "$host" "$port"
+}
+
+# Normalize a URL. If the scheme is missing, default to https://.
+normalize_url() {
+  local url="${1:-}"
+  [[ -z "$url" ]] && return 1
+  if [[ "$url" =~ ^https?:// ]]; then
+    url="${url%/}"
+    printf '%s' "$url"
+    return 0
+  fi
+  url="https://${url%/}"
+  printf '%s' "$url"
+}
+
+# Extract host (and optional port) from a URL or bare domain.
+extract_host_from_url() {
+  local input="${1:-}"
+  [[ -z "$input" ]] && return 1
+  input="${input#http://}"
+  input="${input#https://}"
+  input="${input%%/*}"
+  input="${input%%\?*}"
+  input="${input%%#*}"
+  input="${input%/}"
+  printf '%s' "$input"
 }
 
 # ---------------------------------------------------------------------
@@ -236,6 +263,11 @@ parse_define() {
   ' "$file" 2>/dev/null | \
     sed -nE "s/.*define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"][[:space:]]*\).*/\1/p" | \
     head -n1
+}
+
+parse_table_prefix() {
+  local file="$1"
+  sed -nE "s/^\s*\$table_prefix\s*=\s*'([^']+)'.*/\1/p" "$file" | head -n1
 }
 
 # Fallback to WP-CLI for reading config values if parse_define fails
@@ -565,6 +597,11 @@ check_mysql_root() {
 
 mysql_exec() { mysql "${MYSQL_ROOT_ARGS[@]}" -e "$1"; }
 
+mysql_exec_db() {
+  local db="$1"; shift
+  mysql "${MYSQL_ROOT_ARGS[@]}" "$db" -e "$*"
+}
+
 ensure_db_and_user() {
   local db="$1" user="$2" pass="$3"
   mysql_exec "CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
@@ -654,6 +691,58 @@ list_packages() {
 
 has_sql() { [[ -f "${IMPORT_DIR}/$1.sql.gz" ]]; }
 has_tar() { [[ -f "${IMPORT_DIR}/$1.webroot.tar.gz" ]]; }
+
+update_domain_references() {
+  local path="$1" db="$2" prefix="$3" old_url="$4" new_url="$5" old_host="$6" new_host="$7"
+  [[ -z "$prefix" ]] && prefix="wp_"
+  new_url="${new_url%/}"
+  old_url="${old_url%/}"
+  old_host="${old_host%/}"
+  new_host="${new_host%/}"
+  if [[ -z "$new_url" || -z "$new_host" ]]; then
+    warn "Domain baru tidak valid; lewati update URL"
+    return 1
+  fi
+  if command -v wp >/dev/null 2>&1; then
+    log "[domain] Memperbarui siteurl/home -> $new_url"
+    if (cd "$path" && wp option update siteurl "$new_url" --allow-root >/dev/null 2>&1 && \
+        wp option update home "$new_url" --allow-root >/dev/null 2>&1); then
+      ok "[domain] siteurl/home diperbarui"
+    else
+      warn "[domain] Gagal update siteurl/home via WP-CLI"
+    fi
+    if [[ -n "$old_url" && "$old_url" != "$new_url" ]]; then
+      log "[domain] Search-replace URL: $old_url -> $new_url"
+      if (cd "$path" && wp search-replace "$old_url" "$new_url" --skip-columns=guid --all-tables --allow-root >/dev/null 2>&1); then
+        ok "[domain] URL diganti di database"
+      else
+        warn "[domain] Search-replace URL gagal"
+      fi
+    fi
+    if [[ -n "$old_host" && "$old_host" != "$new_host" ]]; then
+      log "[domain] Search-replace domain: $old_host -> $new_host"
+      if (cd "$path" && wp search-replace "$old_host" "$new_host" --skip-columns=guid --all-tables --allow-root >/dev/null 2>&1); then
+        ok "[domain] Domain diganti di database"
+      else
+        warn "[domain] Search-replace domain gagal"
+      fi
+    fi
+  else
+    warn "WP-CLI tidak ditemukan; update hanya siteurl/home"
+    local new_url_sql
+    new_url_sql="$(escape_squote "$new_url")"
+    local query
+    printf -v query "UPDATE \`%soptions\` SET option_value='%s' WHERE option_name IN ('siteurl','home');" "$prefix" "$new_url_sql"
+    if mysql_exec_db "$db" "$query"; then
+      ok "[domain] siteurl/home diperbarui via MySQL"
+    else
+      warn "[domain] Gagal update siteurl/home via MySQL"
+    fi
+    if [[ -n "$old_host" && "$old_host" != "$new_host" ]]; then
+      warn "Lakukan search-replace domain manual karena WP-CLI tidak tersedia"
+    fi
+  fi
+}
 
 # Process one site during import
 process_site_import() {
@@ -792,6 +881,118 @@ process_site_replace_import() {
   log "--- Selesai replace import ${site} ---"
 }
 
+process_site_clone_to_new_domain() {
+  local package="$1" new_url_raw="$2" old_url_override="$3"
+  local new_url="" new_host=""
+  new_url="$(normalize_url "$new_url_raw" || true)"
+  if [[ -z "$new_url" ]]; then
+    err "URL baru tidak valid"
+    return 1
+  fi
+  new_host="$(extract_host_from_url "$new_url" || true)"
+  if [[ -z "$new_host" ]]; then
+    err "Gagal mengambil domain dari URL baru"
+    return 1
+  fi
+  local tarf="${IMPORT_DIR}/${package}.webroot.tar.gz"
+  local sqlf="${IMPORT_DIR}/${package}.sql.gz"
+  if [[ ! -f "$tarf" ]]; then
+    err "File webroot tidak ditemukan: $(basename "$tarf")"
+    return 1
+  fi
+  local src_dir="${WEBROOT_BASE_IMPORT}/${package}"
+  local dst_dir="${WEBROOT_BASE_IMPORT}/${new_host}"
+  log "=== Clone ${package} -> ${new_host} ==="
+  mkdir -p "$WEBROOT_BASE_IMPORT"
+  if [[ "$dst_dir" == "$src_dir" ]]; then
+    if [[ -d "$dst_dir" ]]; then
+      local backup_same="${dst_dir}.$(date +%Y%m%d%H%M%S).bak"
+      warn "[$new_host] Direktori sudah ada; backup ke $backup_same"
+      mv "$dst_dir" "$backup_same"
+    fi
+  else
+    if [[ -d "$dst_dir" ]]; then
+      local backup_dst="${dst_dir}.$(date +%Y%m%d%H%M%S).bak"
+      warn "[$new_host] Direktori target sudah ada; backup ke $backup_dst"
+      mv "$dst_dir" "$backup_dst"
+    fi
+    if [[ -d "$src_dir" ]]; then
+      local backup_src="${src_dir}.$(date +%Y%m%d%H%M%S).bak"
+      warn "[$package] Direktori sisa ditemukan; backup ke $backup_src"
+      mv "$src_dir" "$backup_src"
+    fi
+  fi
+  log "[${package}] Ekstrak webroot"
+  tar -C "$WEBROOT_BASE_IMPORT" -xzf "$tarf"
+  ok "[${package}] Ekstrak webroot selesai"
+  local extracted_dir="$src_dir"
+  if [[ ! -d "$extracted_dir" ]]; then
+    err "Direktori hasil ekstrak tidak ditemukan: $extracted_dir"
+    return 1
+  fi
+  local dst="$extracted_dir"
+  if [[ "$package" != "$new_host" ]]; then
+    mv "$extracted_dir" "$dst_dir"
+    dst="$dst_dir"
+  fi
+  local cfg="$dst/wp-config.php"
+  if [[ ! -f "$cfg" ]]; then
+    err "wp-config.php tidak ditemukan di $dst"
+    return 1
+  fi
+  local db_name db_user db_pass db_host
+  db_name="$(parse_define "$cfg" DB_NAME || true)"
+  db_user="$(parse_define "$cfg" DB_USER || true)"
+  db_pass="$(parse_define "$cfg" DB_PASSWORD || true)"
+  db_host="$(parse_define "$cfg" DB_HOST || true)"
+  if [[ -z "$db_name" || -z "$db_user" ]]; then
+    warn "[$package] Kredensial DB tidak lengkap di wp-config.php"
+    read -r -p "Masukkan DB_NAME untuk ${new_host}: " db_name
+    read -r -p "Masukkan DB_USER untuk ${new_host}: " db_user
+    read -r -s -p "Masukkan DB_PASSWORD untuk ${new_host} (boleh kosong): " db_pass; echo
+    read -r -p "Masukkan DB_HOST untuk ${new_host} [localhost]: " db_host_in
+    db_host="${db_host_in:-localhost}"
+    sed -i "s/define\\s*(\'?DB_NAME\'?\s*,\s*'.*');/define( 'DB_NAME', '${db_name}' );/I" "$cfg" || true
+    sed -i "s/define\\s*(\'?DB_USER\'?\s*,\s*'.*');/define( 'DB_USER', '${db_user}' );/I" "$cfg" || true
+    local pw_repl="define( 'DB_PASSWORD', '${db_pass}' );"
+    sed -i "s/define\\s*(\'?DB_PASSWORD\'?\s*,\s*'.*');/${pw_repl}/I" "$cfg" || true
+    if [[ -n "$db_host" ]]; then
+      sed -i "s/define\\s*(\'?DB_HOST\'?\s*,\s*'.*');/define( 'DB_HOST', '${db_host}' );/I" "$cfg" || true
+    fi
+    ok "[$new_host] wp-config.php diperbarui dengan kredensial baru"
+  fi
+  db_host="${db_host:-localhost}"
+  check_mysql_root
+  ensure_db_and_user "$db_name" "$db_user" "$db_pass"
+  if [[ -f "$sqlf" ]]; then
+    import_sql_gz "$db_name" "$sqlf" || warn "[$new_host] Gagal impor SQL"
+  else
+    warn "[$new_host] File SQL tidak ditemukan; lewati impor DB"
+  fi
+  local prefix
+  prefix="$(parse_table_prefix "$cfg" || true)"
+  [[ -z "$prefix" ]] && prefix="wp_"
+  local old_url="$old_url_override"
+  if [[ -z "$old_url" ]]; then
+    local query
+    printf -v query "SELECT option_value FROM \`%soptions\` WHERE option_name='siteurl' LIMIT 1;" "$prefix"
+    old_url="$(mysql "${MYSQL_ROOT_ARGS[@]}" -N -B "$db_name" -e "$query" 2>/dev/null || true)"
+  fi
+  [[ -z "$old_url" ]] && old_url="https://${package}"
+  local old_host
+  old_host="$(extract_host_from_url "$old_url" || true)"
+  [[ -z "$old_host" ]] && old_host="$package"
+  update_domain_references "$dst" "$db_name" "$prefix" "$old_url" "$new_url" "$old_host" "$new_host"
+  fix_permissions "$dst"
+  prompt_php_version_if_needed
+  if ! gen_nginx_server_block "$new_host" "$dst" "$DEFAULT_PHP_VERSION"; then
+    warn "[$new_host] Gagal membuat nginx block"
+  fi
+  log "--- Selesai clone ${package} -> ${new_host} ---"
+  [[ -n "$SERVER_IP_HINT" ]] && echo "Atur DNS ${new_host} -> ${SERVER_IP_HINT}"
+  echo
+}
+
 # Interactive menu for import operations
 menu_import() {
   require_cmds_import
@@ -908,6 +1109,47 @@ menu_import() {
   done
 }
 
+menu_clone_domain() {
+  require_cmds_import
+  clear
+  echo "------------- IMPORT KE DOMAIN BARU -------------"
+  echo "Directory paket : $IMPORT_DIR"
+  echo "Root web        : $WEBROOT_BASE_IMPORT"
+  echo "--------------------------------------------------"
+  local sites=()
+  while IFS= read -r s; do sites+=("$s"); done < <(list_packages)
+  local total=${#sites[@]}
+  if (( total == 0 )); then
+    warn "Tidak ada paket untuk diproses."
+    read -r -p "Enter untuk kembali..." _
+    return
+  fi
+  echo "Pilih paket yang ingin di-clone ke domain baru:"
+  local i=1
+  for s in "${sites[@]}"; do
+    printf "  %2d) %s\n" "$i" "$s"
+    i=$((i+1))
+  done
+  local idx
+  read -r -p "Masukkan nomor paket: " idx
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > total )); then
+    warn "Nomor tidak valid."
+    read -r -p "Enter untuk kembali..." _
+    return
+  fi
+  local selected="${sites[$((idx-1))]}"
+  local new_url
+  while true; do
+    read -r -p "Masukkan URL baru (misal https://domainbaru.com): " new_url
+    [[ -n "$new_url" ]] && break
+    warn "URL baru tidak boleh kosong."
+  done
+  local old_url_override=""
+  read -r -p "URL lama (opsional, override otomatis): " old_url_override
+  process_site_clone_to_new_domain "$selected" "$new_url" "$old_url_override" || warn "Clone gagal untuk $selected"
+  read -r -p "Tekan Enter untuk kembali ke menu utama..." _
+}
+
 # ---------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------
@@ -916,13 +1158,14 @@ while true; do
   echo
   echo "============== WORDPRESS MIGRATION MENU =============="
   show_usage
-  read -r -p "Pilih opsi [0-5]: " choice
+  read -r -p "Pilih opsi [0-6]: " choice
   case "$choice" in
     1) menu_export ;;
     2) menu_import ;;
     3) clean_banner ;;
     4) cleanup_backups ;;
     5) full_cleanup_all_data ;;
+    6) menu_clone_domain ;;
     0) echo "Keluar."; exit 0 ;;
     *) warn "Pilihan tidak dikenal. Coba lagi." ;;
   esac
